@@ -2,13 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.fetchAllContacts = fetchAllContacts;
 exports.fetchAllOpportunities = fetchAllOpportunities;
-// =============================================================================
-// Cliente GoHighLevel API v2
-// Docs: https://highlevel.stoplight.io/docs/integrations
-// Base: https://services.leadconnectorhq.com
-// Auth: Authorization: Bearer {GHL_API_KEY}
-//       Version: 2021-07-28
-// =============================================================================
+exports.fetchAllPipelines = fetchAllPipelines;
 const GHL_BASE_URL = 'https://services.leadconnectorhq.com';
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION = process.env.GHL_LOCATION_ID;
@@ -23,59 +17,92 @@ function ghlHeaders() {
         'Content-Type': 'application/json',
     };
 }
+const GHL_TIMEOUT_MS = 30_000; // 30 s por request a GHL
 async function ghlFetch(path) {
     const url = `${GHL_BASE_URL}${path}`;
-    const res = await fetch(url, { headers: ghlHeaders() });
+    console.log(`[GHL] → ${url}`);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), GHL_TIMEOUT_MS);
+    const res = await fetch(url, { headers: ghlHeaders(), signal: controller.signal })
+        .finally(() => clearTimeout(timer));
+    console.log(`[GHL] ← ${res.status} ${res.statusText}`);
     if (!res.ok) {
         const body = await res.text().catch(() => '');
+        console.error(`[GHL] Error body: ${body}`);
         throw new Error(`GHL ${res.status} en ${path}: ${body}`);
     }
-    return res.json();
+    const json = await res.json();
+    // Log compacto de la respuesta para ver estructura y conteos
+    if (typeof json === 'object' && json !== null) {
+        const keys = Object.keys(json);
+        const preview = {};
+        for (const k of keys) {
+            const val = json[k];
+            preview[k] = Array.isArray(val) ? `[${val.length} items]` : val;
+        }
+        console.log(`[GHL] Respuesta:`, JSON.stringify(preview, null, 2));
+    }
+    return json;
 }
 // ── Contactos ─────────────────────────────────────────────────────────────────
 /**
- * Obtiene todos los contactos del location, manejando paginación automáticamente.
- * GHL usa cursor-based pagination con startAfterId.
- * Limit máximo por request: 100.
+ * Descarga contactos de GHL.
+ * @param sinceEpochMs  Si se provee, solo trae contactos con dateAdded > este timestamp (ms).
+ *                      Usado por el sync incremental. Omitir para sync completo.
  */
-async function fetchAllContacts() {
+async function fetchAllContacts(sinceEpochMs) {
     const all = [];
-    let startAfterId = null;
+    let total = null;
+    let page = 0;
+    const baseParams = `locationId=${GHL_LOCATION}&limit=100${sinceEpochMs ? `&startAfter=${sinceEpochMs}` : ''}`;
+    let nextPath = `/contacts/?${baseParams}`;
+    console.log(`[GHL] Iniciando fetch de contactos. Location: "${GHL_LOCATION}"${sinceEpochMs ? ` — incremental desde ${new Date(sinceEpochMs).toISOString()}` : ' — completo'}`);
     while (true) {
-        const params = new URLSearchParams({
-            locationId: GHL_LOCATION,
-            limit: '100',
-        });
-        if (startAfterId)
-            params.set('startAfterId', startAfterId);
-        const data = await ghlFetch(`/contacts/?${params.toString()}`);
+        page++;
+        console.log(`[GHL] Contactos página ${page} — acumulados: ${all.length} / total: ${total ?? '?'}`);
+        const data = await ghlFetch(nextPath);
+        if (total === null)
+            total = data.meta.total ?? 0;
         all.push(...data.contacts);
-        if (!data.meta.startAfterId || data.contacts.length < 100)
+        // Condiciones de parada:
+        // 1. Página incompleta (última página real)
+        // 2. Ya tenemos todos los contactos según el total
+        // 3. GHL no provee nextPageUrl
+        if (data.contacts.length < 100 ||
+            all.length >= total ||
+            !data.meta.nextPageUrl)
             break;
-        startAfterId = data.meta.startAfterId;
+        // Extraer solo el path+query de la URL completa que devuelve GHL
+        nextPath = data.meta.nextPageUrl.replace(GHL_BASE_URL, '');
     }
+    console.log(`[GHL] Fetch contactos completo: ${all.length} contactos`);
     return all;
 }
 // ── Oportunidades ─────────────────────────────────────────────────────────────
-/**
- * Obtiene todas las oportunidades del location, manejando paginación.
- * GHL usa paginación por página (page=1, 2, 3...) para opportunities.
- * Limit máximo por request: 100.
- */
 async function fetchAllOpportunities() {
     const all = [];
     let page = 1;
+    console.log(`[GHL] Iniciando fetch de oportunidades. Location: "${GHL_LOCATION}"`);
     while (true) {
         const params = new URLSearchParams({
             location_id: GHL_LOCATION,
             limit: '100',
             page: String(page),
         });
+        console.log(`[GHL] Oportunidades página ${page} — params: ${params.toString()}`);
         const data = await ghlFetch(`/opportunities/search?${params.toString()}`);
         all.push(...data.opportunities);
+        console.log(`[GHL] Oportunidades acumuladas: ${all.length} / meta:`, data.meta);
         if (!data.meta.nextPage || data.opportunities.length < 100)
             break;
         page++;
     }
     return all;
+}
+// ── Pipelines ─────────────────────────────────────────────────────────────────
+async function fetchAllPipelines() {
+    console.log(`[GHL] Fetch de pipelines. Location: "${GHL_LOCATION}"`);
+    const data = await ghlFetch(`/opportunities/pipelines?locationId=${GHL_LOCATION}`);
+    console.log(`[GHL] ${data.pipelines.length} pipelines obtenidos`);
+    return data.pipelines;
 }

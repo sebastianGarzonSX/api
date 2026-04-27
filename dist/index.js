@@ -10,6 +10,8 @@ const dashboard_js_1 = require("./routes/dashboard.js");
 const leads_js_1 = require("./routes/leads.js");
 const opportunities_js_1 = require("./routes/opportunities.js");
 const sync_js_1 = require("./routes/sync.js");
+const meta_js_1 = require("./routes/meta.js");
+const reports_js_1 = require("./routes/reports.js");
 const syncJob_js_1 = require("./jobs/syncJob.js");
 // ── Validar variables críticas al arrancar ────────────────────────────────────
 const REQUIRED_ENV = [
@@ -39,6 +41,8 @@ app.use('/api/dashboard', dashboard_js_1.dashboardRouter);
 app.use('/api/leads', leads_js_1.leadsRouter);
 app.use('/api/opportunities', opportunities_js_1.opportunitiesRouter);
 app.use('/api/sync', sync_js_1.syncRouter);
+app.use('/api/meta', meta_js_1.metaRouter);
+app.use('/api/reports', reports_js_1.reportsRouter);
 // ── 404 global ────────────────────────────────────────────────────────────────
 app.use((_req, res) => {
     res.status(404).json({ error: 'Ruta no encontrada', status: 404 });
