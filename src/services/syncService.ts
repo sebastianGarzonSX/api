@@ -18,6 +18,38 @@ import type {
 // Sync de Meta: últimos 30 días (o 90 días en sync forzado).
 // =============================================================================
 
+// ── Helpers de enriquecimiento ────────────────────────────────────────────────
+
+const CITY_PATTERNS: Array<{ city: string; patterns: string[] }> = [
+  { city: 'bogota',       patterns: ['bogotá', 'bogota'] },
+  { city: 'bucaramanga',  patterns: ['bucaramanga'] },
+  { city: 'medellin',     patterns: ['medellín', 'medellin'] },
+  { city: 'barranquilla', patterns: ['barranquilla'] },
+]
+
+function extractCityFromTags(tags: string[]): string | null {
+  const joined = tags.join(' ').toLowerCase()
+  for (const { city, patterns } of CITY_PATTERNS) {
+    if (patterns.some((p) => joined.includes(p))) return city
+  }
+  return null
+}
+
+const SURVEY_TAG_MAP: Record<string, string> = {
+  lm_dolores:  'dolores',
+  lm_ventas:   'ventas',
+  lm_claridad: 'claridad',
+  lm_equipos:  'equipos',
+}
+
+function extractSurveyResponse(tags: string[]): string | null {
+  for (const tag of tags) {
+    const val = SURVEY_TAG_MAP[tag.toLowerCase()]
+    if (val) return val
+  }
+  return null
+}
+
 // ── Mapeo de stage ────────────────────────────────────────────────────────────
 
 function buildContactName(c: GHLContact): string {
@@ -117,7 +149,21 @@ export async function runSync(force = false): Promise<SyncResult> {
       console.log(`[Sync] ${fieldDefs.length} custom field definitions sincronizadas`)
     }
   } catch (err) {
+    console.warn(`[Sync] fetchCustomFieldDefinitions falló, cargando desde DB como fallback`)
     errors.push(`fetchCustomFieldDefinitions: ${err instanceof Error ? err.message : String(err)}`)
+  }
+
+  // Fallback: si el fetch falló, cargar definiciones desde la DB
+  if (fieldNameMap.size === 0) {
+    const { data: dbDefs } = await supabaseAdmin
+      .from('custom_field_definitions')
+      .select('ghl_field_id, name')
+    for (const d of dbDefs ?? []) {
+      fieldNameMap.set(d.ghl_field_id, d.name)
+    }
+    if (fieldNameMap.size > 0) {
+      console.log(`[Sync] ${fieldNameMap.size} custom field definitions cargadas desde DB (fallback)`)
+    }
   }
 
   // ── Paso 0b: Pipelines (caché de nombres y stages) ────────────────────────
@@ -233,11 +279,19 @@ export async function runSync(force = false): Promise<SyncResult> {
       const customFieldsObj: Record<string, string> = {}
       for (const cf of c.customFields ?? []) {
         const name = fieldNameMap.get(cf.id) ?? cf.id
-        const val  = Array.isArray(cf.fieldValue)
-          ? cf.fieldValue.join(', ')
-          : (cf.fieldValue ?? '')
+        const raw  = cf.value ?? cf.fieldValue
+        const val  = Array.isArray(raw)
+          ? raw.join(', ')
+          : (raw ?? '')
         if (val) customFieldsObj[name] = val
       }
+
+      const contactTags    = c.tags ?? []
+      const dateAdded      = c.dateAdded   ?? null
+      const dateUpdated    = c.dateUpdated ?? null
+      const interacted     = dateUpdated && dateAdded
+        ? new Date(dateUpdated).getTime() > new Date(dateAdded).getTime() + 6 * 3_600_000
+        : dateUpdated != null
 
       return {
         ghl_contact_id:           c.id,
@@ -246,9 +300,12 @@ export async function runSync(force = false): Promise<SyncResult> {
         phone:                    c.phone  || null,
         source:                   c.source || null,
         stage:                    contactStageMap.get(c.id) ?? 'new',
-        ghl_date_added:           c.dateAdded   ?? null,
-        last_activity_at:         c.dateUpdated ?? null,
-        tags:                     c.tags ?? [],
+        ghl_date_added:           dateAdded,
+        last_activity_at:         dateUpdated,
+        tags:                     contactTags,
+        city:                     extractCityFromTags(contactTags),
+        interaction_status:       interacted ? 'interacted' : 'cold',
+        survey_response:          extractSurveyResponse(contactTags),
         custom_fields:            customFieldsObj,
         attribution_ad_id:        firstAttr?.utmAdId           ?? null,
         attribution_ad_name:      firstAttr?.adName            ?? null,

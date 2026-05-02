@@ -226,6 +226,127 @@ adminRouter.post('/tutorials', ...adminAuth, async (req, res) => {
   }
 })
 
+// GET /api/admin/data-health — diagnostic report on data quality
+adminRouter.get('/data-health', ...adminAuth, async (_req, res) => {
+  try {
+    const [
+      leadsTotal,
+      leadsWithAttribution,
+      leadsWithTags,
+      leadsWithCustomFields,
+      leadsWithCity,
+      leadsWithInteraction,
+      topAttributionAds,
+      topTags,
+      pipelinesData,
+      stagesData,
+      metaCampaignsData,
+      metaAdsData,
+      syncStateData,
+      opportunitiesTotal,
+      opportunitiesWon,
+      hotmartSalesCount,
+    ] = await Promise.all([
+      supabaseAdmin.from('leads').select('id', { count: 'exact', head: true }),
+      supabaseAdmin.from('leads').select('id', { count: 'exact', head: true }).not('attribution_ad_id', 'is', null),
+      supabaseAdmin.from('leads').select('id', { count: 'exact', head: true }).not('tags', 'eq', '{}'),
+      supabaseAdmin.from('leads').select('id', { count: 'exact', head: true }).not('custom_fields', 'is', null),
+      supabaseAdmin.from('leads').select('id', { count: 'exact', head: true }).not('city', 'is', null),
+      supabaseAdmin.from('leads').select('id', { count: 'exact', head: true }).eq('interaction_status', 'interacted'),
+      supabaseAdmin.from('leads').select('attribution_ad_id, attribution_ad_name').not('attribution_ad_id', 'is', null).limit(500),
+      supabaseAdmin.rpc('get_lead_tags', { p_since: new Date(Date.now() - 180 * 86_400_000).toISOString().slice(0, 10), p_until: new Date().toISOString().slice(0, 10) }),
+      supabaseAdmin.from('pipelines').select('id, name'),
+      supabaseAdmin.from('pipeline_stages').select('id, pipeline_id, name, position').order('position'),
+      supabaseAdmin.from('meta_campaigns').select('campaign_id, campaign_name, spend, impressions, clicks, date_start, date_stop').order('date_start', { ascending: false }).limit(50),
+      supabaseAdmin.from('meta_ads').select('ad_id, ad_name, ad_status, spend, campaign_name').order('spend', { ascending: false }).limit(50),
+      supabaseAdmin.from('sync_state').select('key, value'),
+      supabaseAdmin.from('opportunities').select('id', { count: 'exact', head: true }),
+      supabaseAdmin.from('opportunities').select('id', { count: 'exact', head: true }).eq('status', 'won'),
+      supabaseAdmin.from('hotmart_sales').select('id', { count: 'exact', head: true }),
+    ])
+
+    const total         = leadsTotal.count ?? 0
+    const withAttrib    = leadsWithAttribution.count ?? 0
+    const withTags      = leadsWithTags.count ?? 0
+    const withCF        = leadsWithCustomFields.count ?? 0
+    const withCity      = leadsWithCity.count ?? 0
+    const withInteract  = leadsWithInteraction.count ?? 0
+
+    const adIdSet = new Set((topAttributionAds.data ?? []).map((r: any) => r.attribution_ad_id))
+    const metaAdIds = new Set((metaAdsData.data ?? []).map((r: any) => r.ad_id))
+    const matchedAds = [...adIdSet].filter(id => metaAdIds.has(id))
+
+    const classTags = ((topTags.data ?? []) as Array<{ tag: string; cnt: number }>)
+      .filter((t: any) => t.tag?.toLowerCase().startsWith('clase '))
+
+    res.json({
+      generated_at: new Date().toISOString(),
+      leads: {
+        total,
+        with_attribution: withAttrib,
+        without_attribution: total - withAttrib,
+        attribution_rate: total > 0 ? `${((withAttrib / total) * 100).toFixed(1)}%` : '0%',
+        with_tags: withTags,
+        with_custom_fields: withCF,
+        with_city: withCity,
+        with_interaction: withInteract,
+      },
+      opportunities: {
+        total: opportunitiesTotal.count ?? 0,
+        won: opportunitiesWon.count ?? 0,
+      },
+      hotmart_sales: {
+        total: hotmartSalesCount.count ?? 0,
+      },
+      attribution_cross_check: {
+        unique_ad_ids_in_leads: adIdSet.size,
+        total_meta_ads_in_db: metaAdIds.size,
+        matched_ads: matchedAds.length,
+        unmatched_lead_ads: adIdSet.size - matchedAds.length,
+        match_rate: adIdSet.size > 0 ? `${((matchedAds.length / adIdSet.size) * 100).toFixed(1)}%` : 'N/A',
+      },
+      clase_en_vivo: {
+        tags_found: classTags.length,
+        tags: classTags.slice(0, 20),
+      },
+      pipelines: (pipelinesData.data ?? []).map((p: any) => ({
+        id: p.id,
+        name: p.name,
+        stages: (stagesData.data ?? [])
+          .filter((s: any) => s.pipeline_id === p.id)
+          .sort((a: any, b: any) => a.position - b.position)
+          .map((s: any) => ({ name: s.name, position: s.position })),
+      })),
+      meta_campaigns: {
+        total_in_db: (metaCampaignsData.data ?? []).length,
+        recent: (metaCampaignsData.data ?? []).slice(0, 10).map((c: any) => ({
+          id: c.campaign_id,
+          name: c.campaign_name,
+          spend: c.spend,
+          impressions: c.impressions,
+          date_start: c.date_start,
+          date_stop: c.date_stop,
+        })),
+      },
+      meta_ads: {
+        total_in_db: (metaAdsData.data ?? []).length,
+        top_by_spend: (metaAdsData.data ?? []).slice(0, 10).map((a: any) => ({
+          ad_id: a.ad_id,
+          name: a.ad_name,
+          status: a.ad_status,
+          spend: a.spend,
+          campaign: a.campaign_name,
+        })),
+      },
+      sync_state: Object.fromEntries(
+        (syncStateData.data ?? []).map((s: any) => [s.key, s.value])
+      ),
+    })
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Error' })
+  }
+})
+
 // POST /api/admin/billing/checkout — upgrade redirect
 adminRouter.post('/billing/checkout', authenticate, async (req, res) => {
   try {

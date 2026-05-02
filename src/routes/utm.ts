@@ -4,6 +4,106 @@ import { authenticate } from '../middleware/auth.js'
 
 export const utmRouter = Router()
 
+// ── Funnel Links CRUD ───────────────────────────────────────────────────────
+
+// GET /api/utm/funnel-links
+utmRouter.get('/funnel-links', authenticate, async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('funnel_links')
+      .select('*')
+      .eq('user_id', req.user!.id)
+      .order('created_at', { ascending: false })
+    if (error) { res.status(500).json({ error: error.message }); return }
+    res.json(data ?? [])
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Error' })
+  }
+})
+
+// POST /api/utm/funnel-links
+utmRouter.post('/funnel-links', authenticate, async (req, res) => {
+  try {
+    const { label, base_url, category } = req.body as { label: string; base_url: string; category?: string }
+    if (!label || !base_url) { res.status(400).json({ error: 'label y base_url requeridos' }); return }
+    const { data, error } = await supabaseAdmin
+      .from('funnel_links')
+      .insert({ user_id: req.user!.id, label, base_url, category: category ?? 'general' })
+      .select()
+      .single()
+    if (error) { res.status(500).json({ error: error.message }); return }
+    res.json(data)
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Error' })
+  }
+})
+
+// DELETE /api/utm/funnel-links/:id
+utmRouter.delete('/funnel-links/:id', authenticate, async (req, res) => {
+  try {
+    const { error } = await supabaseAdmin
+      .from('funnel_links')
+      .delete()
+      .eq('id', req.params.id)
+      .eq('user_id', req.user!.id)
+    if (error) { res.status(500).json({ error: error.message }); return }
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Error' })
+  }
+})
+
+// ── UTM Conventions CRUD ────────────────────────────────────────────────────
+
+// GET /api/utm/conventions
+utmRouter.get('/conventions', authenticate, async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('utm_conventions')
+      .select('*')
+      .eq('user_id', req.user!.id)
+      .order('param')
+    if (error) { res.status(500).json({ error: error.message }); return }
+    res.json(data ?? [])
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Error' })
+  }
+})
+
+// POST /api/utm/conventions
+utmRouter.post('/conventions', authenticate, async (req, res) => {
+  try {
+    const { param, value } = req.body as { param: string; value: string }
+    if (!param || !value) { res.status(400).json({ error: 'param y value requeridos' }); return }
+    const { data, error } = await supabaseAdmin
+      .from('utm_conventions')
+      .upsert({ user_id: req.user!.id, param, value }, { onConflict: 'user_id,param,value' })
+      .select()
+      .single()
+    if (error) { res.status(500).json({ error: error.message }); return }
+    res.json(data)
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Error' })
+  }
+})
+
+// DELETE /api/utm/conventions/:id
+utmRouter.delete('/conventions/:id', authenticate, async (req, res) => {
+  try {
+    const { error } = await supabaseAdmin
+      .from('utm_conventions')
+      .delete()
+      .eq('id', req.params.id)
+      .eq('user_id', req.user!.id)
+    if (error) { res.status(500).json({ error: error.message }); return }
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Error' })
+  }
+})
+
+// ── UTM Stats (Hotmart) ────────────────────────────────────────────────────
+
 // GET /api/utm/stats?group=campaign|content&since=&until=&tz=
 utmRouter.get('/stats', authenticate, async (req, res) => {
   try {

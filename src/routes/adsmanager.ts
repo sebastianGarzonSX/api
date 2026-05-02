@@ -60,7 +60,6 @@ async function metaPost(path: string, token: string, body: Record<string, string
 // Paginar todos los resultados de Meta
 async function metaFetchAll<T>(path: string, token: string, params: Record<string, string>): Promise<T[]> {
   const all: T[] = []
-  let nextUrl: string | undefined
 
   const proof = appSecretProof(token)
   const baseParams = new URLSearchParams({
@@ -68,20 +67,19 @@ async function metaFetchAll<T>(path: string, token: string, params: Record<strin
     ...(proof ? { appsecret_proof: proof } : {}),
     ...params,
   })
-  let currentUrl: string | undefined = `${META_BASE}${path}?${baseParams}`
+  let url: string | undefined = `${META_BASE}${path}?${baseParams}`
 
-  while (currentUrl) {
+  while (url) {
     const ctrl = new AbortController()
     const t = setTimeout(() => ctrl.abort(), META_TIMEOUT_MS)
-    const res = await fetch(nextUrl || currentUrl, { signal: ctrl.signal }).finally(() => clearTimeout(t))
+    const res = await fetch(url, { signal: ctrl.signal }).finally(() => clearTimeout(t))
     if (!res.ok) {
       const b = await res.text().catch(() => '')
       throw new Error(`Meta API ${res.status}: ${b}`)
     }
     const page = await res.json() as { data?: T[]; paging?: { next?: string } }
     if (page.data) all.push(...page.data)
-    nextUrl    = page.paging?.next
-    currentUrl = undefined
+    url = page.paging?.next
   }
   return all
 }
@@ -624,8 +622,30 @@ adsmanagerRouter.get('/recommendations', authenticate, async (req, res) => {
     const campStatusMap = new Map<string, string>()
     for (const c of campMeta) campStatusMap.set(c['id'] as string, c['effective_status'] as string)
 
-    const campaigns = rows.map(row => {
-      const spend       = parseFloat(row['spend'] as string ?? '0')
+    // Aggregate by campaign_id to avoid duplicates from pagination
+    const byId = new Map<string, Record<string, unknown>>()
+    for (const row of rows) {
+      const id = row['campaign_id'] as string
+      if (!byId.has(id)) {
+        byId.set(id, { ...row, spend: parseFloat(row['spend'] as string ?? '0') })
+      } else {
+        const cur = byId.get(id)!
+        cur['spend'] = (cur['spend'] as number) + parseFloat(row['spend'] as string ?? '0')
+        cur['impressions'] = (parseInt(cur['impressions'] as string ?? '0', 10) + parseInt(row['impressions'] as string ?? '0', 10))
+        cur['clicks'] = (parseInt(cur['clicks'] as string ?? '0', 10) + parseInt(row['clicks'] as string ?? '0', 10))
+        const curActions = (cur['actions'] as Array<Record<string, unknown>>) ?? []
+        const rowActions = (row['actions'] as Array<Record<string, unknown>>) ?? []
+        const merged: Record<string, number> = {}
+        for (const a of [...curActions, ...rowActions]) {
+          const k = a['action_type'] as string
+          merged[k] = (merged[k] ?? 0) + parseFloat(a['value'] as string ?? '0')
+        }
+        cur['actions'] = Object.entries(merged).map(([action_type, value]) => ({ action_type, value: String(value) }))
+      }
+    }
+
+    const campaigns = [...byId.values()].map(row => {
+      const spend       = typeof row['spend'] === 'number' ? row['spend'] : parseFloat(row['spend'] as string ?? '0')
       const impressions = parseInt(row['impressions'] as string ?? '0', 10)
       const clicks      = parseInt(row['clicks'] as string ?? '0', 10)
       const actions     = (row['actions'] as Array<Record<string, string>>) ?? []

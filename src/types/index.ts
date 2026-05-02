@@ -74,7 +74,8 @@ export interface GHLAttribution {
 
 export interface GHLCustomFieldValue {
   id:          string   // UUID del custom field en GHL
-  fieldValue:  string | string[] | null
+  fieldValue?: string | string[] | null
+  value?:      string | string[] | null  // GHL API v2 returns "value" instead of "fieldValue"
 }
 
 export interface GHLContact {
