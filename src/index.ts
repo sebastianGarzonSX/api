@@ -7,6 +7,14 @@ import { opportunitiesRouter }   from './routes/opportunities.js'
 import { syncRouter }            from './routes/sync.js'
 import { metaRouter }            from './routes/meta.js'
 import { reportsRouter }         from './routes/reports.js'
+import { claseRouter }           from './routes/clase.js'
+import { adsmanagerRouter }      from './routes/adsmanager.js'
+import { hotmartRouter }         from './routes/hotmart.js'
+import { utmRouter }             from './routes/utm.js'
+import { announcementsRouter }   from './routes/announcements.js'
+import { tutorialsRouter }       from './routes/tutorials.js'
+import { pushRouter }            from './routes/push.js'
+import { adminRouter }           from './routes/admin.js'
 import { startSyncJob }          from './jobs/syncJob.js'
 
 // ── Validar variables críticas al arrancar ────────────────────────────────────
@@ -38,12 +46,25 @@ app.get('/health', (_req, res) => {
 
 // ── Rutas ──────────────────────────────────────────────────────────────────────
 // Prefijo /api/* — Next.js reescribe /api/* hacia este servidor
-app.use('/api/dashboard',     dashboardRouter)
-app.use('/api/leads',         leadsRouter)
-app.use('/api/opportunities', opportunitiesRouter)
-app.use('/api/sync',          syncRouter)
-app.use('/api/meta',          metaRouter)
-app.use('/api/reports',       reportsRouter)
+app.use('/api/dashboard',       dashboardRouter)
+app.use('/api/leads',           leadsRouter)
+app.use('/api/opportunities',   opportunitiesRouter)
+app.use('/api/sync',            syncRouter)
+app.use('/api/meta',            metaRouter)
+app.use('/api/reports',         reportsRouter)
+app.use('/api/clase',           claseRouter)
+// AdsManager PRO
+app.use('/api/adsmanager',      adsmanagerRouter)
+app.use('/api/hotmart',         hotmartRouter)
+app.post('/webhook/hotmart',    (req, res, next) => {
+  req.url = '/webhook'
+  hotmartRouter(req, res, next)
+})
+app.use('/api/utm',             utmRouter)
+app.use('/api/announcements',   announcementsRouter)
+app.use('/api/tutorials',       tutorialsRouter)
+app.use('/api/push',            pushRouter)
+app.use('/api/admin',           adminRouter)
 
 // ── 404 global ────────────────────────────────────────────────────────────────
 app.use((_req, res) => {

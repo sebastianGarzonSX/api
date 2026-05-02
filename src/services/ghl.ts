@@ -5,6 +5,8 @@ import type {
   GHLOpportunitiesResponse,
   GHLPipeline,
   GHLPipelinesResponse,
+  GHLCustomFieldDefinition,
+  GHLCustomFieldDefinitionsResponse,
 } from '../types/index.js'
 
 const GHL_BASE_URL = 'https://services.leadconnectorhq.com'
@@ -146,4 +148,20 @@ export async function fetchAllPipelines(): Promise<GHLPipeline[]> {
   )
   console.log(`[GHL] ${data.pipelines.length} pipelines obtenidos`)
   return data.pipelines
+}
+
+// ── Custom Field Definitions ──────────────────────────────────────────────────
+
+export async function fetchCustomFieldDefinitions(): Promise<GHLCustomFieldDefinition[]> {
+  console.log(`[GHL] Fetch de custom field definitions. Location: "${GHL_LOCATION}"`)
+  try {
+    const data = await ghlFetch<GHLCustomFieldDefinitionsResponse>(
+      `/custom-fields/?locationId=${GHL_LOCATION}`
+    )
+    console.log(`[GHL] ${data.customFields?.length ?? 0} custom fields obtenidos`)
+    return data.customFields ?? []
+  } catch (err) {
+    console.warn(`[GHL] No se pudieron obtener custom fields:`, err)
+    return []
+  }
 }

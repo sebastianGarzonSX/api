@@ -72,17 +72,35 @@ export interface GHLAttribution {
   url?:              string
 }
 
+export interface GHLCustomFieldValue {
+  id:          string   // UUID del custom field en GHL
+  fieldValue:  string | string[] | null
+}
+
 export interface GHLContact {
-  id:           string
-  firstName?:   string
-  lastName?:    string
-  contactName?: string
-  email:        string | null
-  phone:        string | null
-  source:       string | null
-  tags:         string[]
-  dateAdded?:   string        // ISO string — fecha real de creación en GHL
-  attributions?: GHLAttribution[]
+  id:              string
+  firstName?:      string
+  lastName?:       string
+  contactName?:    string
+  email:           string | null
+  phone:           string | null
+  source:          string | null
+  tags:            string[]
+  dateAdded?:      string
+  dateUpdated?:    string
+  attributions?:   GHLAttribution[]
+  customFields?:   GHLCustomFieldValue[]
+}
+
+export interface GHLCustomFieldDefinition {
+  id:        string
+  name:      string
+  fieldKey?: string
+  dataType?: string
+}
+
+export interface GHLCustomFieldDefinitionsResponse {
+  customFields: GHLCustomFieldDefinition[]
 }
 
 export interface GHLContactsResponse {

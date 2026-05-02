@@ -1,5 +1,5 @@
 import { supabaseAdmin } from '../lib/supabase.js'
-import { fetchAllContacts, fetchAllOpportunities, fetchAllPipelines } from './ghl.js'
+import { fetchAllContacts, fetchAllOpportunities, fetchAllPipelines, fetchCustomFieldDefinitions } from './ghl.js'
 import { fetchCampaignInsights, fetchAdInsights, fetchAdCreatives } from './meta.js'
 import type {
   GHLContact, GHLOpportunity, GHLPipeline,
@@ -94,7 +94,33 @@ export async function runSync(force = false): Promise<SyncResult> {
 
   console.log(`[Sync] Iniciando sincronización${force ? ' COMPLETA (force)' : ' incremental'}…`)
 
-  // ── Paso 0: Pipelines (caché de nombres y stages) ─────────────────────────
+  // ── Paso 0a: Custom Field Definitions ────────────────────────────────────
+  // Sincronizar primero para tener el mapa id → name al procesar contactos.
+
+  const fieldNameMap = new Map<string, string>()
+  try {
+    const fieldDefs = await fetchCustomFieldDefinitions()
+    for (const f of fieldDefs) {
+      fieldNameMap.set(f.id, f.name)
+    }
+    if (fieldDefs.length > 0) {
+      const defsPayload = fieldDefs.map((f) => ({
+        ghl_field_id: f.id,
+        name:         f.name,
+        field_key:    f.fieldKey ?? null,
+        data_type:    f.dataType ?? null,
+        synced_at:    new Date().toISOString(),
+      }))
+      await supabaseAdmin
+        .from('custom_field_definitions')
+        .upsert(defsPayload, { onConflict: 'ghl_field_id' })
+      console.log(`[Sync] ${fieldDefs.length} custom field definitions sincronizadas`)
+    }
+  } catch (err) {
+    errors.push(`fetchCustomFieldDefinitions: ${err instanceof Error ? err.message : String(err)}`)
+  }
+
+  // ── Paso 0b: Pipelines (caché de nombres y stages) ────────────────────────
   // Siempre sincronizar — son pocos y necesitamos los nombres para el join.
 
   let ghlPipelines: GHLPipeline[] = []
@@ -203,6 +229,16 @@ export async function runSync(force = false): Promise<SyncResult> {
       // Atribución del primer toque (isFirst=true); si no hay, tomar el primero
       const firstAttr = c.attributions?.find((a) => a.isFirst) ?? c.attributions?.[0]
 
+      // Resolver custom fields: {field_name: value}
+      const customFieldsObj: Record<string, string> = {}
+      for (const cf of c.customFields ?? []) {
+        const name = fieldNameMap.get(cf.id) ?? cf.id
+        const val  = Array.isArray(cf.fieldValue)
+          ? cf.fieldValue.join(', ')
+          : (cf.fieldValue ?? '')
+        if (val) customFieldsObj[name] = val
+      }
+
       return {
         ghl_contact_id:           c.id,
         name:                     buildContactName(c),
@@ -210,8 +246,10 @@ export async function runSync(force = false): Promise<SyncResult> {
         phone:                    c.phone  || null,
         source:                   c.source || null,
         stage:                    contactStageMap.get(c.id) ?? 'new',
-        ghl_date_added:           c.dateAdded ?? null,
+        ghl_date_added:           c.dateAdded   ?? null,
+        last_activity_at:         c.dateUpdated ?? null,
         tags:                     c.tags ?? [],
+        custom_fields:            customFieldsObj,
         attribution_ad_id:        firstAttr?.utmAdId           ?? null,
         attribution_ad_name:      firstAttr?.adName            ?? null,
         attribution_utm_source:   firstAttr?.utmSessionSource  ?? null,
