@@ -150,6 +150,56 @@ export async function fetchAllPipelines(): Promise<GHLPipeline[]> {
   return data.pipelines
 }
 
+// ── Appointments (Calendar) ───────────────────────────────────────────────────
+
+export interface GHLAppointment {
+  id:                string
+  calendarId:        string
+  contactId:         string
+  startTime:         string   // ISO 8601
+  endTime:           string
+  appointmentStatus: string   // 'confirmed' | 'cancelled' | 'showed' | 'noshow' | ...
+  title?:            string
+  deleted:           boolean
+}
+
+interface GHLEventsResponse {
+  events: GHLAppointment[]
+}
+
+/**
+ * Obtiene citas de un calendario GHL en un rango de fechas.
+ * Endpoint real: GET /calendars/events  (no /calendars/appointments)
+ * Params: locationId, calendarId, startTime (ms), endTime (ms)
+ */
+export async function fetchCalendarAppointments(
+  calendarId: string,
+  since: string,   // YYYY-MM-DD
+  until: string,   // YYYY-MM-DD
+): Promise<GHLAppointment[]> {
+  const startTime = new Date(since).getTime()
+  const endTime   = new Date(until + 'T23:59:59').getTime()
+
+  console.log(`[GHL] Calendar events calendarId="${calendarId}" ${since} → ${until}`)
+
+  const params = new URLSearchParams({
+    locationId: GHL_LOCATION,
+    calendarId,
+    startTime:  String(startTime),
+    endTime:    String(endTime),
+  })
+
+  try {
+    const data = await ghlFetch<GHLEventsResponse>(
+      `/calendars/events?${params.toString()}`
+    )
+    return data.events ?? []
+  } catch (err) {
+    console.warn('[GHL] Error al obtener calendar events:', err)
+    throw err
+  }
+}
+
 // ── Custom Field Definitions ──────────────────────────────────────────────────
 
 export async function fetchCustomFieldDefinitions(): Promise<GHLCustomFieldDefinition[]> {

@@ -1,6 +1,8 @@
 import { Router } from 'express'
 import { supabaseAdmin } from '../lib/supabase.js'
 import { authenticate } from '../middleware/auth.js'
+import { requireRole } from '../middleware/requireRole.js'
+import { fetchCalendarAppointments } from '../services/ghl.js'
 import type { ApiError } from '../types/index.js'
 
 export const claseRouter = Router()
@@ -58,7 +60,65 @@ claseRouter.get('/report', authenticate, async (req, res) => {
       return
     }
 
-    res.json(data)
+    // Enriquecer con lp_views desde tracking automático
+    const { count: lpCount } = await supabaseAdmin
+      .from('lp_pageviews')
+      .select('*', { count: 'exact', head: true })
+      .eq('tag', tag)
+
+    const enriched = {
+      ...(data as Record<string, unknown>),
+      lp_views: lpCount ?? 0,
+    }
+
+    res.json(enriched)
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Error interno', status: 500 })
+  }
+})
+
+// GET /api/clase/lp-views?tag=clase+29/abril
+claseRouter.get('/lp-views', authenticate, async (req, res) => {
+  try {
+    const tag = (req.query['tag'] as string | undefined) ?? null
+    if (!tag) { res.status(400).json({ error: 'tag requerido', status: 400 }); return }
+
+    const { data, error } = await supabaseAdmin
+      .from('app_settings')
+      .select('value, updated_at')
+      .eq('key', `lp_views:${tag}`)
+      .maybeSingle()
+
+    if (error) { res.status(500).json({ error: error.message, status: 500 }); return }
+    res.json({
+      tag,
+      lp_views:   data?.value ? Number(data.value) : null,
+      updated_at: data?.updated_at ?? null,
+    })
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Error interno', status: 500 })
+  }
+})
+
+// POST /api/clase/lp-views  { tag, lp_views }
+claseRouter.post('/lp-views', authenticate, requireRole('admin'), async (req, res) => {
+  try {
+    const { tag, lp_views } = req.body as { tag?: string; lp_views?: number }
+    if (!tag?.trim()) { res.status(400).json({ error: 'tag requerido', status: 400 }); return }
+    if (lp_views === undefined || lp_views === null || Number.isNaN(Number(lp_views)) || Number(lp_views) < 0) {
+      res.status(400).json({ error: 'lp_views debe ser >= 0', status: 400 }); return
+    }
+
+    const { error } = await supabaseAdmin
+      .from('app_settings')
+      .upsert({
+        key:        `lp_views:${tag.trim()}`,
+        value:      String(Math.round(Number(lp_views))),
+        updated_at: new Date().toISOString(),
+      })
+
+    if (error) { res.status(500).json({ error: error.message, status: 500 }); return }
+    res.json({ success: true, tag: tag.trim(), lp_views: Math.round(Number(lp_views)) })
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : 'Error interno', status: 500 })
   }
@@ -150,6 +210,119 @@ claseRouter.get('/meta', authenticate, async (req, res) => {
     })).sort((a, b) => b.spend - a.spend)
 
     res.json({ campaigns, since, until })
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Error interno', status: 500 })
+  }
+})
+
+// ── Configuración del calendario ──────────────────────────────────────────────
+
+const CALENDAR_KEY = 'ghl_calendar_id'
+
+// GET /api/clase/calendar-config
+claseRouter.get('/calendar-config', authenticate, async (_req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('app_settings')
+      .select('value')
+      .eq('key', CALENDAR_KEY)
+      .maybeSingle()
+
+    if (error) { res.status(500).json({ error: error.message, status: 500 }); return }
+
+    res.json({ calendar_id: data?.value ?? null })
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Error interno', status: 500 })
+  }
+})
+
+// POST /api/clase/calendar-config   { calendar_id: string }
+claseRouter.post('/calendar-config', authenticate, requireRole('admin'), async (req, res) => {
+  try {
+    const { calendar_id } = req.body as { calendar_id?: string }
+    if (!calendar_id?.trim()) {
+      res.status(400).json({ error: 'calendar_id requerido', status: 400 }); return
+    }
+
+    const { error } = await supabaseAdmin
+      .from('app_settings')
+      .upsert({ key: CALENDAR_KEY, value: calendar_id.trim(), updated_at: new Date().toISOString() })
+
+    if (error) { res.status(500).json({ error: error.message, status: 500 }); return }
+
+    res.json({ success: true, calendar_id: calendar_id.trim() })
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Error interno', status: 500 })
+  }
+})
+
+// GET /api/clase/appointments?since=YYYY-MM-DD&until=YYYY-MM-DD
+// Llama a GHL Calendar API con el calendar_id guardado y devuelve el conteo de citas.
+claseRouter.get('/appointments', authenticate, async (req, res) => {
+  try {
+    const now   = new Date()
+    const until = (req.query['until'] as string | undefined) ?? now.toISOString().slice(0, 10)
+    const since = (req.query['since'] as string | undefined)
+      ?? new Date(now.getTime() - 7 * 86_400_000).toISOString().slice(0, 10)
+
+    // Leer calendar_id guardado
+    const { data: cfg, error: cfgError } = await supabaseAdmin
+      .from('app_settings')
+      .select('value')
+      .eq('key', CALENDAR_KEY)
+      .maybeSingle()
+
+    if (cfgError) { res.status(500).json({ error: cfgError.message, status: 500 }); return }
+    if (!cfg?.value) {
+      res.json({ count: null, calendar_id: null, since, until })
+      return
+    }
+
+    const appointments = await fetchCalendarAppointments(cfg.value, since, until)
+
+    // Excluir canceladas y eliminadas
+    const active = appointments.filter(a => a.appointmentStatus !== 'cancelled' && !a.deleted)
+
+    // Enriquecer con datos del lead (nombre, email) leyendo de la tabla `leads`
+    const contactIds = Array.from(new Set(appointments.map(a => a.contactId).filter(Boolean)))
+    let contactsById = new Map<string, { name: string | null; email: string | null }>()
+    if (contactIds.length > 0) {
+      const { data: leads } = await supabaseAdmin
+        .from('leads')
+        .select('ghl_contact_id, name, email')
+        .in('ghl_contact_id', contactIds)
+      contactsById = new Map(
+        (leads ?? []).map(l => [l.ghl_contact_id, { name: l.name, email: l.email }])
+      )
+    }
+
+    const items = appointments
+      .slice()
+      .sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())
+      .map(a => {
+        const c = contactsById.get(a.contactId)
+        return {
+          id:           a.id,
+          contact_id:   a.contactId,
+          contact_name: c?.name ?? null,
+          contact_email: c?.email ?? null,
+          start_time:   a.startTime,
+          end_time:     a.endTime,
+          status:       a.appointmentStatus,
+          cancelled:    a.appointmentStatus === 'cancelled' || a.deleted,
+          title:        a.title ?? null,
+        }
+      })
+
+    res.json({
+      count:       active.length,
+      total:       appointments.length,
+      cancelled:   appointments.length - active.length,
+      calendar_id: cfg.value,
+      since,
+      until,
+      items,
+    })
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : 'Error interno', status: 500 })
   }

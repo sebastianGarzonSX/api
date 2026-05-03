@@ -15,6 +15,7 @@ import { announcementsRouter }   from './routes/announcements.js'
 import { tutorialsRouter }       from './routes/tutorials.js'
 import { pushRouter }            from './routes/push.js'
 import { adminRouter }           from './routes/admin.js'
+import { trackingRouter }        from './routes/tracking.js'
 import { startSyncJob }          from './jobs/syncJob.js'
 
 // ── Validar variables críticas al arrancar ────────────────────────────────────
@@ -65,6 +66,8 @@ app.use('/api/announcements',   announcementsRouter)
 app.use('/api/tutorials',       tutorialsRouter)
 app.use('/api/push',            pushRouter)
 app.use('/api/admin',           adminRouter)
+
+app.use('/api/tracking',        trackingRouter)
 
 // ── 404 global ────────────────────────────────────────────────────────────────
 app.use((_req, res) => {
