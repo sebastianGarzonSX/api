@@ -98,6 +98,7 @@ interface MetaInsightsPage {
 export interface MetaCampaignMetrics {
   campaign_id:     string
   campaign_name:   string
+  account_id:      string
   date_start:      string  // YYYY-MM-DD
   date_stop:       string  // YYYY-MM-DD
   impressions:     number
@@ -118,6 +119,7 @@ export interface MetaAdMetrics {
   adset_name:      string
   campaign_id:     string
   campaign_name:   string
+  account_id:      string
   date_start:      string
   date_stop:       string
   impressions:     number
@@ -166,10 +168,11 @@ function extractCostPerResult(
   return 0
 }
 
-function normalizeInsight(raw: MetaInsightRaw): MetaCampaignMetrics {
+function normalizeInsight(raw: MetaInsightRaw, accountId: string): MetaCampaignMetrics {
   return {
     campaign_id:     raw.campaign_id,
     campaign_name:   raw.campaign_name,
+    account_id:      accountId,
     date_start:      raw.date_start,
     date_stop:       raw.date_stop,
     impressions:     Math.round(parseNum(raw.impressions)),
@@ -192,29 +195,19 @@ function normalizeInsight(raw: MetaInsightRaw): MetaCampaignMetrics {
  * @param since  Fecha de inicio en formato YYYY-MM-DD
  * @param until  Fecha de fin en formato YYYY-MM-DD
  */
-export async function fetchCampaignInsights(
+async function fetchCampaignInsightsForAccount(
+  accountId: string,
   since: string,
   until: string,
 ): Promise<MetaCampaignMetrics[]> {
-  if (!META_TOKEN || !META_ACCOUNT) {
-    throw new Error('META_ACCESS_TOKEN y META_AD_ACCOUNT_ID son requeridos para sync de Meta')
-  }
+  if (!META_TOKEN) throw new Error('META_ACCESS_TOKEN requerido')
 
   const fields = [
-    'campaign_id',
-    'campaign_name',
-    'impressions',
-    'clicks',
-    'spend',
-    'reach',
-    'ctr',
-    'cpm',
-    'actions',
-    'cost_per_action_type',
+    'campaign_id', 'campaign_name', 'impressions', 'clicks',
+    'spend', 'reach', 'ctr', 'cpm', 'actions', 'cost_per_action_type',
   ].join(',')
 
   const proof = getAppSecretProof(META_TOKEN)
-
   const params = new URLSearchParams({
     fields,
     level:          'campaign',
@@ -225,36 +218,49 @@ export async function fetchCampaignInsights(
     ...(proof ? { appsecret_proof: proof } : {}),
   })
 
-  let url: string | undefined = `${META_BASE}/act_${META_ACCOUNT}/insights?${params.toString()}`
+  let url: string | undefined = `${META_BASE}/act_${accountId}/insights?${params.toString()}`
   const all: MetaCampaignMetrics[] = []
   let pageNum = 0
 
-  console.log(`[Meta] Iniciando fetch de insights. Rango: ${since} → ${until}`)
+  console.log(`[Meta] Fetch campaign insights act_${accountId}. Rango: ${since} → ${until}`)
 
   while (url) {
     pageNum++
-    console.log(`[Meta] Página ${pageNum} — acumulados: ${all.length}`)
-
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), META_TIMEOUT_MS)
     const res = await fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer))
 
     if (!res.ok) {
       const body = await res.text().catch(() => '')
-      throw new Error(`Meta API ${res.status}: ${body}`)
+      throw new Error(`Meta API act_${accountId} ${res.status}: ${body}`)
     }
 
     const page = await res.json() as MetaInsightsPage
-
-    if (page.data) {
-      all.push(...page.data.map(normalizeInsight))
-    }
-
+    if (page.data) all.push(...page.data.map((r) => normalizeInsight(r, accountId)))
     url = page.paging?.next
   }
 
-  console.log(`[Meta] Fetch completo: ${all.length} registros (${pageNum} páginas)`)
+  console.log(`[Meta] act_${accountId}: ${all.length} registros (${pageNum} páginas)`)
   return all
+}
+
+export async function fetchCampaignInsights(
+  since: string,
+  until: string,
+): Promise<MetaCampaignMetrics[]> {
+  if (!META_TOKEN || !META_ACCOUNT) {
+    throw new Error('META_ACCESS_TOKEN y META_AD_ACCOUNT_ID son requeridos para sync de Meta')
+  }
+
+  // Cuentas a sincronizar: cuenta principal + cuenta de eventos (si está configurada)
+  const accounts = [META_ACCOUNT]
+  const eventAccount = process.env.META_AD_ACCOUNT_ID_EVENTOS
+  if (eventAccount && eventAccount !== META_ACCOUNT) accounts.push(eventAccount)
+
+  const results = await Promise.all(
+    accounts.map((acc) => fetchCampaignInsightsForAccount(acc, since, until))
+  )
+  return results.flat()
 }
 
 // ── Fetch a nivel de anuncio (para join con GHL attribution_ad_id) ─────────────
@@ -268,7 +274,7 @@ interface MetaAdInsightRaw extends MetaInsightRaw {
   adset_name: string
 }
 
-function normalizeAdInsight(raw: MetaAdInsightRaw): MetaAdMetrics {
+function normalizeAdInsight(raw: MetaAdInsightRaw, accountId: string): MetaAdMetrics {
   return {
     ad_id:           raw.ad_id,
     ad_name:         raw.ad_name         ?? '',
@@ -276,6 +282,7 @@ function normalizeAdInsight(raw: MetaAdInsightRaw): MetaAdMetrics {
     adset_name:      raw.adset_name      ?? '',
     campaign_id:     raw.campaign_id,
     campaign_name:   raw.campaign_name   ?? '',
+    account_id:      accountId,
     date_start:      raw.date_start,
     date_stop:       raw.date_stop,
     impressions:     Math.round(parseNum(raw.impressions)),
@@ -287,6 +294,55 @@ function normalizeAdInsight(raw: MetaAdInsightRaw): MetaAdMetrics {
     conversions:     Math.round(extractConversions(raw.actions)),
     cost_per_result: extractCostPerResult(raw.actions, raw.cost_per_action_type),
   }
+}
+
+async function fetchAdInsightsForAccount(
+  accountId: string,
+  since: string,
+  until: string,
+): Promise<MetaAdMetrics[]> {
+  if (!META_TOKEN) throw new Error('META_ACCESS_TOKEN requerido')
+
+  const fields = [
+    'ad_id', 'ad_name', 'adset_id', 'adset_name', 'campaign_id', 'campaign_name',
+    'impressions', 'clicks', 'spend', 'reach', 'ctr', 'cpm', 'actions', 'cost_per_action_type',
+  ].join(',')
+
+  const proof = getAppSecretProof(META_TOKEN)
+  const params = new URLSearchParams({
+    fields,
+    level:          'ad',
+    time_increment: '1',
+    time_range:     JSON.stringify({ since, until }),
+    limit:          '500',
+    access_token:   META_TOKEN,
+    ...(proof ? { appsecret_proof: proof } : {}),
+  })
+
+  let url: string | undefined = `${META_BASE}/act_${accountId}/insights?${params.toString()}`
+  const all: MetaAdMetrics[] = []
+  let pageNum = 0
+
+  console.log(`[Meta] Fetch ad insights act_${accountId}. Rango: ${since} → ${until}`)
+
+  while (url) {
+    pageNum++
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), META_TIMEOUT_MS)
+    const res = await fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer))
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => '')
+      throw new Error(`Meta API ad-level act_${accountId} ${res.status}: ${body}`)
+    }
+
+    const page = await res.json() as { data?: MetaAdInsightRaw[]; paging?: { next?: string } }
+    if (page.data) all.push(...page.data.map((r) => normalizeAdInsight(r, accountId)))
+    url = page.paging?.next
+  }
+
+  console.log(`[Meta] act_${accountId} ad-level: ${all.length} registros`)
+  return all
 }
 
 /**
@@ -301,63 +357,14 @@ export async function fetchAdInsights(
     throw new Error('META_ACCESS_TOKEN y META_AD_ACCOUNT_ID son requeridos')
   }
 
-  const fields = [
-    'ad_id',
-    'ad_name',
-    'adset_id',
-    'adset_name',
-    'campaign_id',
-    'campaign_name',
-    'impressions',
-    'clicks',
-    'spend',
-    'reach',
-    'ctr',
-    'cpm',
-    'actions',
-    'cost_per_action_type',
-  ].join(',')
+  const accounts = [META_ACCOUNT]
+  const eventAccount = process.env.META_AD_ACCOUNT_ID_EVENTOS
+  if (eventAccount && eventAccount !== META_ACCOUNT) accounts.push(eventAccount)
 
-  const proof = getAppSecretProof(META_TOKEN)
-
-  const params = new URLSearchParams({
-    fields,
-    level:          'ad',
-    time_increment: '1',
-    time_range:     JSON.stringify({ since, until }),
-    limit:          '500',
-    access_token:   META_TOKEN,
-    ...(proof ? { appsecret_proof: proof } : {}),
-  })
-
-  let url: string | undefined = `${META_BASE}/act_${META_ACCOUNT}/insights?${params.toString()}`
-  const all: MetaAdMetrics[] = []
-  let pageNum = 0
-
-  console.log(`[Meta] Iniciando fetch de insights a nivel AD. Rango: ${since} → ${until}`)
-
-  while (url) {
-    pageNum++
-    console.log(`[Meta] Ad-level página ${pageNum} — acumulados: ${all.length}`)
-
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), META_TIMEOUT_MS)
-    const res = await fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer))
-
-    if (!res.ok) {
-      const body = await res.text().catch(() => '')
-      throw new Error(`Meta API (ad level) ${res.status}: ${body}`)
-    }
-
-    const page = await res.json() as { data?: MetaAdInsightRaw[]; paging?: { next?: string } }
-    if (page.data) {
-      all.push(...page.data.map(normalizeAdInsight))
-    }
-    url = page.paging?.next
-  }
-
-  console.log(`[Meta] Ad-level fetch completo: ${all.length} registros`)
-  return all
+  const results = await Promise.all(
+    accounts.map((acc) => fetchAdInsightsForAccount(acc, since, until))
+  )
+  return results.flat()
 }
 
 // ── Thumbnails y preview links de anuncios ─────────────────────────────────────
@@ -422,7 +429,7 @@ export async function fetchAdCreatives(adIds: string[]): Promise<AdCreativeInfo[
 
       results.push({
         ad_id:         adId,
-        thumbnail_url: ad.creative?.thumbnail_url ?? ad.creative?.image_url ?? null,
+        thumbnail_url: ad.creative?.image_url ?? ad.creative?.thumbnail_url ?? null,
         preview_link:  ad.preview_shareable_link ?? null,
         ad_status:     adStatus,
       })

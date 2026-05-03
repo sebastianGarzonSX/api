@@ -449,7 +449,7 @@ adsmanagerRouter.get('/top-ads', authenticate, async (req, res) => {
     const result = sorted.map(a => ({
       ...a,
       preview_url:   (previews[a.ad_id as string] as any)?.preview_shareable_link ?? null,
-      thumbnail_url: (previews[a.ad_id as string] as any)?.creative?.thumbnail_url ?? (previews[a.ad_id as string] as any)?.creative?.image_url ?? null,
+      thumbnail_url: (previews[a.ad_id as string] as any)?.creative?.image_url ?? (previews[a.ad_id as string] as any)?.creative?.thumbnail_url ?? null,
     }))
 
     res.json({ ads: result, since: range.since, until: range.until })

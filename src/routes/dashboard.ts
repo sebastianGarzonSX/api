@@ -40,8 +40,60 @@ dashboardRouter.get('/kpis', authenticate, async (req, res) => {
   }
 })
 
+// ── Helper: meta spend filtrado por campaign_ids ─────────────────────────────
+
+async function getFilteredMetaSpend(
+  since: string,
+  until: string,
+  campaignIds: string[]
+): Promise<number> {
+  let query = supabaseAdmin
+    .from('meta_campaigns')
+    .select('spend')
+    .gte('date_start', since)
+    .lte('date_stop', until)
+
+  if (campaignIds.length > 0) {
+    query = query.in('campaign_id', campaignIds)
+  }
+
+  const { data } = await query
+  return (data ?? []).reduce((sum, r) => sum + (r.spend ?? 0), 0)
+}
+
+async function getFilteredMetaTotals(
+  since: string,
+  until: string,
+  campaignIds: string[]
+) {
+  let query = supabaseAdmin
+    .from('meta_campaigns')
+    .select('spend, impressions, clicks, conversions')
+    .gte('date_start', since)
+    .lte('date_stop', until)
+
+  if (campaignIds.length > 0) {
+    query = query.in('campaign_id', campaignIds)
+  }
+
+  const { data } = await query
+  const rows = data ?? []
+  return {
+    spend:       rows.reduce((s, r) => s + (r.spend ?? 0), 0),
+    impressions: rows.reduce((s, r) => s + (r.impressions ?? 0), 0),
+    clicks:      rows.reduce((s, r) => s + (r.clicks ?? 0), 0),
+    conversions: rows.reduce((s, r) => s + (r.conversions ?? 0), 0),
+  }
+}
+
+function parseCampaignIds(raw: unknown): string[] {
+  if (!raw || typeof raw !== 'string') return []
+  return raw.split(',').map((s) => s.trim()).filter(Boolean)
+}
+
 // ── GET /api/dashboard/funnel ─────────────────────────────────────────────────
 // ?city=bucaramanga&since=YYYY-MM-DD&until=YYYY-MM-DD&pipeline_type=registro|venta
+// &campaign_ids=id1,id2 (opcional — filtra el meta_spend por esas campañas)
 
 dashboardRouter.get('/funnel', authenticate, async (req, res) => {
   try {
@@ -49,6 +101,7 @@ dashboardRouter.get('/funnel', authenticate, async (req, res) => {
     const since         = req.query.since         as string | undefined
     const until         = req.query.until         as string | undefined
     const pipelineType  = (req.query.pipeline_type as string | undefined) ?? 'registro'
+    const campaignIds   = parseCampaignIds(req.query.campaign_ids)
 
     if (!city) {
       res.status(400).json({ error: 'Parámetro "city" requerido', status: 400 } as ApiError)
@@ -71,7 +124,6 @@ dashboardRouter.get('/funnel', authenticate, async (req, res) => {
       return
     }
 
-    // Enriquecer cada etapa con stage_key y cost_per_lead
     const result = data as {
       city: string
       since: string
@@ -82,6 +134,11 @@ dashboardRouter.get('/funnel', authenticate, async (req, res) => {
       stages: Array<{ stage_name: string; stage_position: number; count: number; won: number; lost: number }>
     }
 
+    // Si se pasaron campaign_ids, recalcular meta_spend solo de esas campañas
+    const metaSpend = campaignIds.length > 0
+      ? await getFilteredMetaSpend(since, until, campaignIds)
+      : result.meta_spend
+
     const enrichedStages = (result.stages ?? []).map((s) => ({
       stage_key:     mapStageKey(s.stage_name),
       stage_name:    s.stage_name,
@@ -89,12 +146,12 @@ dashboardRouter.get('/funnel', authenticate, async (req, res) => {
       percentage:    result.total_leads > 0
         ? Math.round((s.count / result.total_leads) * 100 * 10) / 10
         : 0,
-      cost_per_lead: result.meta_spend > 0 && s.count > 0
-        ? Math.round((result.meta_spend / s.count) * 100) / 100
+      cost_per_lead: metaSpend > 0 && s.count > 0
+        ? Math.round((metaSpend / s.count) * 100) / 100
         : null,
     }))
 
-    res.json({ ...result, stages: enrichedStages })
+    res.json({ ...result, meta_spend: metaSpend, stages: enrichedStages })
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : 'Error interno', status: 500 } as ApiError)
   }
@@ -102,12 +159,14 @@ dashboardRouter.get('/funnel', authenticate, async (req, res) => {
 
 // ── GET /api/dashboard/traffic ────────────────────────────────────────────────
 // ?since=YYYY-MM-DD&until=YYYY-MM-DD&city=bucaramanga (city opcional)
+// &campaign_ids=id1,id2 (opcional — recalcula métricas Meta solo de esas campañas)
 
 dashboardRouter.get('/traffic', authenticate, async (req, res) => {
   try {
-    const since = req.query.since as string | undefined
-    const until = req.query.until as string | undefined
-    const city  = (req.query.city as string | undefined) ?? null
+    const since       = req.query.since as string | undefined
+    const until       = req.query.until as string | undefined
+    const city        = (req.query.city as string | undefined) ?? null
+    const campaignIds = parseCampaignIds(req.query.campaign_ids)
 
     if (!since || !until) {
       res.status(400).json({ error: 'Parámetros "since" y "until" requeridos', status: 400 } as ApiError)
@@ -125,7 +184,111 @@ dashboardRouter.get('/traffic', authenticate, async (req, res) => {
       return
     }
 
+    // Si se filtra por campañas, recalcular las métricas de Meta
+    if (campaignIds.length > 0) {
+      const meta = await getFilteredMetaTotals(since, until, campaignIds)
+
+      const result = data as Record<string, unknown>
+      result.meta_spend       = meta.spend
+      result.meta_impressions = meta.impressions
+      result.meta_clicks      = meta.clicks
+      result.meta_leads       = meta.conversions
+
+      result.meta_ctr = meta.impressions > 0
+        ? Math.round((meta.clicks / meta.impressions) * 100 * 10000) / 10000
+        : 0
+      result.meta_cpc = meta.clicks > 0
+        ? Math.round((meta.spend / meta.clicks) * 10000) / 10000
+        : 0
+      result.meta_cpl = meta.conversions > 0
+        ? Math.round((meta.spend / meta.conversions) * 10000) / 10000
+        : 0
+
+      const crmLeads = (result.crm_leads as number) ?? 0
+      result.crm_cpl = crmLeads > 0
+        ? Math.round((meta.spend / crmLeads) * 10000) / 10000
+        : 0
+      result.variation_absolute = meta.conversions - crmLeads
+      result.variation_pct = meta.conversions > 0
+        ? Math.round(((meta.conversions - crmLeads) / meta.conversions) * 100 * 100) / 100
+        : 0
+    }
+
     res.json(data)
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Error interno', status: 500 } as ApiError)
+  }
+})
+
+// ── GET /api/dashboard/campaigns ─────────────────────────────────────────────
+// ?since=YYYY-MM-DD&until=YYYY-MM-DD&account_type=eventos|clase
+// Lista campañas únicas de meta_campaigns con gasto total, para el selector.
+// account_type=eventos  → filtra por META_AD_ACCOUNT_ID_EVENTOS (CP5)
+// account_type=clase    → filtra por META_AD_ACCOUNT_ID       (CP6)
+// Sin account_type      → todas las cuentas
+
+dashboardRouter.get('/campaigns', authenticate, async (req, res) => {
+  try {
+    const since        = req.query.since        as string | undefined
+    const until        = req.query.until        as string | undefined
+    const accountType  = req.query.account_type as string | undefined
+
+    if (!since || !until) {
+      res.status(400).json({ error: 'Parámetros "since" y "until" requeridos', status: 400 } as ApiError)
+      return
+    }
+
+    // Resolver account_id según el tipo solicitado
+    let filterAccountId: string | undefined
+    if (accountType === 'eventos') {
+      filterAccountId = process.env.META_AD_ACCOUNT_ID_EVENTOS
+    } else if (accountType === 'clase') {
+      filterAccountId = process.env.META_AD_ACCOUNT_ID
+    }
+
+    let allRows: Array<{ campaign_id: string; campaign_name: string; spend: number }> = []
+    let from = 0
+    const PAGE = 1000
+
+    while (true) {
+      let query = supabaseAdmin
+        .from('meta_campaigns')
+        .select('campaign_id, campaign_name, spend')
+        .gte('date_start', since)
+        .lte('date_stop', until)
+
+      if (filterAccountId) {
+        query = query.eq('account_id', filterAccountId)
+      }
+
+      const { data, error } = await query.range(from, from + PAGE - 1)
+
+      if (error) {
+        res.status(500).json({ error: error.message, code: 'DB_ERROR', status: 500 } as ApiError)
+        return
+      }
+
+      allRows = allRows.concat(data ?? [])
+      if (!data || data.length < PAGE) break
+      from += PAGE
+    }
+
+    const byId = new Map<string, { campaign_id: string; campaign_name: string; spend: number }>()
+    for (const row of allRows) {
+      const cur = byId.get(row.campaign_id)
+      if (!cur) {
+        byId.set(row.campaign_id, {
+          campaign_id:   row.campaign_id,
+          campaign_name: row.campaign_name ?? '',
+          spend:         row.spend ?? 0,
+        })
+      } else {
+        cur.spend += row.spend ?? 0
+      }
+    }
+
+    const campaigns = [...byId.values()].sort((a, b) => b.spend - a.spend)
+    res.json({ campaigns, since, until })
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : 'Error interno', status: 500 } as ApiError)
   }

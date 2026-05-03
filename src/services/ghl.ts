@@ -108,6 +108,17 @@ export async function fetchAllContacts(sinceEpochMs?: number): Promise<GHLContac
   return all
 }
 
+// ── Contacto individual ───────────────────────────────────────────────────────
+
+export async function fetchContactById(contactId: string): Promise<GHLContact | null> {
+  try {
+    const data = await ghlFetch<{ contact: GHLContact }>(`/contacts/${contactId}`)
+    return data.contact ?? null
+  } catch {
+    return null
+  }
+}
+
 // ── Oportunidades ─────────────────────────────────────────────────────────────
 
 export async function fetchAllOpportunities(): Promise<GHLOpportunity[]> {

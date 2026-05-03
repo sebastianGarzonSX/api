@@ -1,5 +1,5 @@
 import { supabaseAdmin } from '../lib/supabase.js'
-import { fetchAllContacts, fetchAllOpportunities, fetchAllPipelines, fetchCustomFieldDefinitions } from './ghl.js'
+import { fetchAllContacts, fetchAllOpportunities, fetchAllPipelines, fetchCustomFieldDefinitions, fetchContactById } from './ghl.js'
 import { fetchCampaignInsights, fetchAdInsights, fetchAdCreatives } from './meta.js'
 import type {
   GHLContact, GHLOpportunity, GHLPipeline,
@@ -77,6 +77,53 @@ function mapGHLStatus(status: string): OpportunityStatus {
   if (status === 'won')  return 'won'
   if (status === 'lost' || status === 'abandoned') return 'lost'
   return 'open'
+}
+
+// ── Transformar GHLContact → lead payload ─────────────────────────────────────
+
+function contactToLeadPayload(
+  c: GHLContact,
+  fieldNameMap: Map<string, string>,
+  contactStageMap: Map<string, LeadStage>
+) {
+  const firstAttr = c.attributions?.find((a) => a.isFirst) ?? c.attributions?.[0]
+
+  const customFieldsObj: Record<string, string> = {}
+  for (const cf of c.customFields ?? []) {
+    const name = fieldNameMap.get(cf.id) ?? cf.id
+    const raw  = cf.value ?? cf.fieldValue
+    const val  = Array.isArray(raw) ? raw.join(', ') : (raw ?? '')
+    if (val) customFieldsObj[name] = val
+  }
+
+  const contactTags = c.tags ?? []
+  const dateAdded   = c.dateAdded   ?? null
+  const dateUpdated = c.dateUpdated ?? null
+  const interacted  = dateUpdated && dateAdded
+    ? new Date(dateUpdated).getTime() > new Date(dateAdded).getTime() + 6 * 3_600_000
+    : dateUpdated != null
+
+  return {
+    ghl_contact_id:         c.id,
+    name:                   buildContactName(c),
+    email:                  c.email  || null,
+    phone:                  c.phone  || null,
+    source:                 c.source || null,
+    stage:                  contactStageMap.get(c.id) ?? 'new' as LeadStage,
+    ghl_date_added:         dateAdded,
+    last_activity_at:       dateUpdated,
+    tags:                   contactTags,
+    city:                   extractCityFromTags(contactTags),
+    interaction_status:     interacted ? 'interacted' : 'cold',
+    survey_response:        extractSurveyResponse(contactTags),
+    custom_fields:          customFieldsObj,
+    attribution_ad_id:      firstAttr?.utmAdId           ?? null,
+    attribution_ad_name:    firstAttr?.adName            ?? null,
+    attribution_utm_source: firstAttr?.utmSessionSource  ?? null,
+    attribution_medium:     firstAttr?.medium            ?? null,
+    attribution_page_url:   firstAttr?.pageUrl           ?? null,
+    updated_at:             new Date().toISOString(),
+  }
 }
 
 // ── Helpers de sync_state ─────────────────────────────────────────────────────
@@ -271,50 +318,9 @@ export async function runSync(force = false): Promise<SyncResult> {
     }
     console.log(`[Sync] Contactos únicos: ${uniqueContacts.size}`)
 
-    const leadsPayload = [...uniqueContacts.values()].map((c) => {
-      // Atribución del primer toque (isFirst=true); si no hay, tomar el primero
-      const firstAttr = c.attributions?.find((a) => a.isFirst) ?? c.attributions?.[0]
-
-      // Resolver custom fields: {field_name: value}
-      const customFieldsObj: Record<string, string> = {}
-      for (const cf of c.customFields ?? []) {
-        const name = fieldNameMap.get(cf.id) ?? cf.id
-        const raw  = cf.value ?? cf.fieldValue
-        const val  = Array.isArray(raw)
-          ? raw.join(', ')
-          : (raw ?? '')
-        if (val) customFieldsObj[name] = val
-      }
-
-      const contactTags    = c.tags ?? []
-      const dateAdded      = c.dateAdded   ?? null
-      const dateUpdated    = c.dateUpdated ?? null
-      const interacted     = dateUpdated && dateAdded
-        ? new Date(dateUpdated).getTime() > new Date(dateAdded).getTime() + 6 * 3_600_000
-        : dateUpdated != null
-
-      return {
-        ghl_contact_id:           c.id,
-        name:                     buildContactName(c),
-        email:                    c.email  || null,
-        phone:                    c.phone  || null,
-        source:                   c.source || null,
-        stage:                    contactStageMap.get(c.id) ?? 'new',
-        ghl_date_added:           dateAdded,
-        last_activity_at:         dateUpdated,
-        tags:                     contactTags,
-        city:                     extractCityFromTags(contactTags),
-        interaction_status:       interacted ? 'interacted' : 'cold',
-        survey_response:          extractSurveyResponse(contactTags),
-        custom_fields:            customFieldsObj,
-        attribution_ad_id:        firstAttr?.utmAdId           ?? null,
-        attribution_ad_name:      firstAttr?.adName            ?? null,
-        attribution_utm_source:   firstAttr?.utmSessionSource  ?? null,
-        attribution_medium:       firstAttr?.medium            ?? null,
-        attribution_page_url:     firstAttr?.pageUrl           ?? null,
-        updated_at:               new Date().toISOString(),
-      }
-    })
+    const leadsPayload = [...uniqueContacts.values()].map(
+      (c) => contactToLeadPayload(c, fieldNameMap, contactStageMap)
+    )
 
     for (let i = 0; i < leadsPayload.length; i += 500) {
       const batch = leadsPayload.slice(i, i + 500)
@@ -357,6 +363,38 @@ export async function runSync(force = false): Promise<SyncResult> {
       }
     }
     console.log(`[Sync] Lead ID map: ${leadIdMap.size} entradas`)
+
+    // ── Rescue: traer contactos huérfanos que tienen oportunidades pero no
+    //    están en la tabla leads (p.ej. contactos viejos que el sync incremental
+    //    no trajo, pero que fueron agregados a un pipeline recientemente) ──────
+    const orphanContactIds = contactIds.filter((id) => !leadIdMap.has(id))
+    if (orphanContactIds.length > 0) {
+      console.log(`[Sync] ${orphanContactIds.length} contactos huérfanos detectados — rescatando de GHL…`)
+      let rescued = 0
+      for (const cid of orphanContactIds) {
+        try {
+          const contact = await fetchContactById(cid)
+          if (!contact) continue
+          const payload = contactToLeadPayload(contact, fieldNameMap, contactStageMap)
+          const { data: upserted, error: uErr } = await supabaseAdmin
+            .from('leads')
+            .upsert(payload, { onConflict: 'ghl_contact_id' })
+            .select('id, ghl_contact_id')
+            .single()
+
+          if (uErr) {
+            errors.push(`rescue lead ${cid}: ${uErr.message}`)
+          } else if (upserted) {
+            leadIdMap.set(upserted.ghl_contact_id, upserted.id)
+            leads_upserted++
+            rescued++
+          }
+        } catch (err) {
+          errors.push(`rescue fetch ${cid}: ${err instanceof Error ? err.message : String(err)}`)
+        }
+      }
+      console.log(`[Sync] ${rescued}/${orphanContactIds.length} contactos huérfanos rescatados`)
+    }
 
     const uniqueOpps = new Map<string, GHLOpportunity>()
     for (const o of ghlOpportunities) {
