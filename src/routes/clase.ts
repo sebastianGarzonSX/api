@@ -3,6 +3,7 @@ import { supabaseAdmin } from '../lib/supabase.js'
 import { authenticate } from '../middleware/auth.js'
 import { requireRole } from '../middleware/requireRole.js'
 import { fetchCalendarAppointments } from '../services/ghl.js'
+import { fetchPixelEvents } from '../services/meta.js'
 import type { ApiError } from '../types/index.js'
 
 export const claseRouter = Router()
@@ -215,6 +216,142 @@ claseRouter.get('/meta', authenticate, async (req, res) => {
   }
 })
 
+// ── Pixel events (gracias-general.html · Lead, Contact, WhatsAppGroupClick) ───
+// Devuelve los eventos del pixel agregados por las campañas [CLASE SEM] del
+// período (o de la semana asociada al tag). Sirve para validar que el pixel
+// está disparando lo esperado y para pintar tiles en ClaseEnVivo sin tocar la
+// landing.
+//
+// GET /api/clase/pixel-events?tag=clase+29/abril&since=&until=
+claseRouter.get('/pixel-events', authenticate, async (req, res) => {
+  try {
+    const tag = (req.query['tag'] as string | undefined)?.trim() || null
+    const now = new Date()
+    const reqUntil = (req.query['until'] as string | undefined) ?? now.toISOString().slice(0, 10)
+    const reqSince = (req.query['since'] as string | undefined)
+      ?? new Date(now.getTime() - 30 * 86_400_000).toISOString().slice(0, 10)
+
+    // Si hay tag, usamos la semana de la clase para buscar la campaña que corrió.
+    const weekRange = tag ? tagToWeekRange(tag) : null
+    const since = weekRange?.since ?? reqSince
+    const until = weekRange?.until ?? reqUntil
+
+    const all = await fetchPixelEvents(since, until)
+
+    // Filtrar a campañas de Clase en Vivo
+    const claseRows = all.filter((r) =>
+      (r.campaign_name ?? '').toLowerCase().includes('clase sem')
+    )
+
+    // Eventos que nos interesan reportar (mapeo a label legible).
+    // El action_type real puede variar: Meta a veces usa el alias canónico
+    // ('lead', 'contact_total') y a veces el namespaced del pixel
+    // ('offsite_conversion.fb_pixel_lead'). Sumamos cualquiera que coincida.
+    const TARGETS: Array<{ key: string; label: string; matchers: (t: string) => boolean }> = [
+      {
+        key: 'page_view',
+        label: 'PageView',
+        matchers: (t) =>
+          t === 'page_view' ||
+          t === 'landing_page_view' ||
+          t === 'offsite_conversion.fb_pixel_view_content' ||
+          t.endsWith('.fb_pixel_page_view'),
+      },
+      {
+        key: 'lead',
+        label: 'Lead',
+        matchers: (t) => t === 'lead' || t.endsWith('.fb_pixel_lead'),
+      },
+      {
+        key: 'complete_registration',
+        label: 'CompleteRegistration',
+        matchers: (t) =>
+          t === 'complete_registration' ||
+          t.endsWith('.fb_pixel_complete_registration'),
+      },
+      {
+        key: 'contact',
+        label: 'Contact',
+        matchers: (t) =>
+          t === 'contact_total' || t === 'contact' || t.endsWith('.fb_pixel_contact'),
+      },
+      {
+        key: 'wa_group_click',
+        label: 'WhatsAppGroupClick',
+        matchers: (t) => t.toLowerCase().includes('whatsappgroupclick'),
+      },
+    ]
+
+    // Acumular totales y por campaña
+    const totals: Record<string, { count: number; cost_per: number; spend_share: number }> = {}
+    const byCampaign: Array<{
+      campaign_id:   string
+      campaign_name: string
+      spend:         number
+      events:        Record<string, number>
+      raw_actions:   Record<string, number>
+    }> = []
+
+    for (const t of TARGETS) totals[t.key] = { count: 0, cost_per: 0, spend_share: 0 }
+
+    let totalSpend = 0
+
+    for (const row of claseRows) {
+      totalSpend += row.spend
+
+      const events: Record<string, number> = {}
+      for (const t of TARGETS) {
+        let count = 0
+        let costAcc = 0
+        let costN = 0
+        for (const [actionType, value] of Object.entries(row.actions)) {
+          if (t.matchers(actionType)) {
+            count += value
+            const cpa = row.cost_per_action[actionType]
+            if (cpa && value > 0) { costAcc += cpa * value; costN += value }
+          }
+        }
+        events[t.key] = count
+        totals[t.key].count += count
+        totals[t.key].cost_per += costAcc
+        totals[t.key].spend_share += costN
+      }
+
+      byCampaign.push({
+        campaign_id:   row.campaign_id,
+        campaign_name: row.campaign_name,
+        spend:         row.spend,
+        events,
+        raw_actions:   row.actions,
+      })
+    }
+
+    // cost_per final: weighted average por campaña
+    const totalsOut = TARGETS.map((t) => {
+      const agg = totals[t.key]
+      return {
+        key:      t.key,
+        label:    t.label,
+        count:    agg.count,
+        cost_per: agg.spend_share > 0 ? agg.cost_per / agg.spend_share : 0,
+      }
+    })
+
+    res.json({
+      since,
+      until,
+      tag,
+      total_spend:   totalSpend,
+      campaign_count: claseRows.length,
+      totals:        totalsOut,
+      by_campaign:   byCampaign,
+    })
+  } catch (err) {
+    console.warn('[Clase/PixelEvents] error:', err)
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Error interno', status: 500 })
+  }
+})
+
 // ── Configuración del calendario ──────────────────────────────────────────────
 
 const CALENDAR_KEY = 'ghl_calendar_id'
@@ -256,14 +393,27 @@ claseRouter.post('/calendar-config', authenticate, requireRole('admin'), async (
   }
 })
 
-// GET /api/clase/appointments?since=YYYY-MM-DD&until=YYYY-MM-DD
+// GET /api/clase/appointments?since=YYYY-MM-DD&until=YYYY-MM-DD&tag=clase+29/abril
 // Llama a GHL Calendar API con el calendar_id guardado y devuelve el conteo de citas.
+// Si se provee `tag`, filtra a leads con ese tag y amplía la ventana de búsqueda
+// para capturar agendamientos posteriores a la fecha de la clase.
 claseRouter.get('/appointments', authenticate, async (req, res) => {
   try {
     const now   = new Date()
-    const until = (req.query['until'] as string | undefined) ?? now.toISOString().slice(0, 10)
-    const since = (req.query['since'] as string | undefined)
+    const tag   = (req.query['tag'] as string | undefined)?.trim() || null
+
+    const reqUntil = (req.query['until'] as string | undefined) ?? now.toISOString().slice(0, 10)
+    const reqSince = (req.query['since'] as string | undefined)
       ?? new Date(now.getTime() - 7 * 86_400_000).toISOString().slice(0, 10)
+
+    // Cuando se filtra por tag, ampliamos la ventana: −30 / +60 días desde el rango pedido,
+    // así capturamos agendamientos en semanas siguientes a la clase.
+    const since = tag
+      ? new Date(new Date(reqSince).getTime() - 30 * 86_400_000).toISOString().slice(0, 10)
+      : reqSince
+    const until = tag
+      ? new Date(new Date(reqUntil).getTime() + 60 * 86_400_000).toISOString().slice(0, 10)
+      : reqUntil
 
     // Leer calendar_id guardado
     const { data: cfg, error: cfgError } = await supabaseAdmin
@@ -274,17 +424,39 @@ claseRouter.get('/appointments', authenticate, async (req, res) => {
 
     if (cfgError) { res.status(500).json({ error: cfgError.message, status: 500 }); return }
     if (!cfg?.value) {
-      res.json({ count: null, calendar_id: null, since, until })
+      res.json({ count: null, calendar_id: null, since, until, tag })
       return
     }
 
     const appointments = await fetchCalendarAppointments(cfg.value, since, until)
 
+    // Si hay tag, obtener los contact_ids de leads que tienen ese tag
+    let allowedContactIds: Set<string> | null = null
+    if (tag) {
+      const { data: tagLeads, error: tagErr } = await supabaseAdmin
+        .from('leads')
+        .select('ghl_contact_id, tags')
+        .contains('tags', [tag])
+      if (tagErr) {
+        console.warn('[Clase/Appointments] error filtrando leads por tag:', tagErr.message)
+      }
+      allowedContactIds = new Set(
+        (tagLeads ?? [])
+          .map(l => l.ghl_contact_id)
+          .filter((id): id is string => Boolean(id)),
+      )
+    }
+
+    // Aplicar filtro de tag (si corresponde)
+    const filtered = allowedContactIds
+      ? appointments.filter(a => a.contactId && allowedContactIds!.has(a.contactId))
+      : appointments
+
     // Excluir canceladas y eliminadas
-    const active = appointments.filter(a => a.appointmentStatus !== 'cancelled' && !a.deleted)
+    const active = filtered.filter(a => a.appointmentStatus !== 'cancelled' && !a.deleted)
 
     // Enriquecer con datos del lead (nombre, email) leyendo de la tabla `leads`
-    const contactIds = Array.from(new Set(appointments.map(a => a.contactId).filter(Boolean)))
+    const contactIds = Array.from(new Set(filtered.map(a => a.contactId).filter(Boolean)))
     let contactsById = new Map<string, { name: string | null; email: string | null }>()
     if (contactIds.length > 0) {
       const { data: leads } = await supabaseAdmin
@@ -296,7 +468,7 @@ claseRouter.get('/appointments', authenticate, async (req, res) => {
       )
     }
 
-    const items = appointments
+    const items = filtered
       .slice()
       .sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime())
       .map(a => {
@@ -316,11 +488,12 @@ claseRouter.get('/appointments', authenticate, async (req, res) => {
 
     res.json({
       count:       active.length,
-      total:       appointments.length,
-      cancelled:   appointments.length - active.length,
+      total:       filtered.length,
+      cancelled:   filtered.length - active.length,
       calendar_id: cfg.value,
       since,
       until,
+      tag,
       items,
     })
   } catch (err) {

@@ -263,6 +263,104 @@ export async function fetchCampaignInsights(
   return results.flat()
 }
 
+// ── Pixel events por campaña (granularidad por action_type) ───────────────────
+// Para reportar eventos del pixel que el dashboard ya consume (Lead, Contact,
+// CompleteRegistration, eventos custom como WhatsAppGroupClick, etc.).
+// A diferencia de fetchCampaignInsights, NO agregamos en `conversions` —
+// devolvemos el detalle por action_type.
+
+export interface MetaCampaignActionRow {
+  campaign_id:    string
+  campaign_name:  string
+  account_id:     string
+  date_start:     string
+  date_stop:      string
+  spend:          number
+  impressions:    number
+  clicks:         number
+  /** Conteo por action_type tal cual lo devuelve Meta. */
+  actions:        Record<string, number>
+  /** Costo por action_type. */
+  cost_per_action: Record<string, number>
+}
+
+async function fetchPixelEventsForAccount(
+  accountId: string,
+  since: string,
+  until: string,
+): Promise<MetaCampaignActionRow[]> {
+  if (!META_TOKEN) throw new Error('META_ACCESS_TOKEN requerido')
+
+  const fields = [
+    'campaign_id', 'campaign_name', 'spend', 'impressions', 'clicks',
+    'actions', 'cost_per_action_type',
+  ].join(',')
+
+  const proof = getAppSecretProof(META_TOKEN)
+  const params = new URLSearchParams({
+    fields,
+    level:        'campaign',
+    // Sin time_increment: agregamos por toda la ventana, una fila por campaña.
+    time_range:   JSON.stringify({ since, until }),
+    limit:        '500',
+    access_token: META_TOKEN,
+    ...(proof ? { appsecret_proof: proof } : {}),
+  })
+
+  const url = `${META_BASE}/act_${accountId}/insights?${params.toString()}`
+  console.log(`[Meta] Fetch pixel events act_${accountId}. Rango: ${since} → ${until}`)
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), META_TIMEOUT_MS)
+  const res = await fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer))
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '')
+    throw new Error(`Meta API pixel-events act_${accountId} ${res.status}: ${body}`)
+  }
+
+  const page = await res.json() as MetaInsightsPage
+  return (page.data ?? []).map((raw) => {
+    const actions: Record<string, number> = {}
+    for (const a of raw.actions ?? []) actions[a.action_type] = parseNum(a.value)
+    const costPer: Record<string, number> = {}
+    for (const c of raw.cost_per_action_type ?? []) costPer[c.action_type] = parseNum(c.value)
+    return {
+      campaign_id:    raw.campaign_id,
+      campaign_name:  raw.campaign_name,
+      account_id:     accountId,
+      date_start:     raw.date_start,
+      date_stop:      raw.date_stop,
+      spend:          parseNum(raw.spend),
+      impressions:    Math.round(parseNum(raw.impressions)),
+      clicks:         Math.round(parseNum(raw.clicks)),
+      actions,
+      cost_per_action: costPer,
+    }
+  })
+}
+
+/**
+ * Descarga eventos del pixel agregados por campaña en el rango pedido.
+ * Recorre la cuenta principal y la cuenta de eventos (si está configurada).
+ */
+export async function fetchPixelEvents(
+  since: string,
+  until: string,
+): Promise<MetaCampaignActionRow[]> {
+  if (!META_TOKEN || !META_ACCOUNT) {
+    throw new Error('META_ACCESS_TOKEN y META_AD_ACCOUNT_ID son requeridos')
+  }
+  const accounts = [META_ACCOUNT]
+  const eventAccount = process.env.META_AD_ACCOUNT_ID_EVENTOS
+  if (eventAccount && eventAccount !== META_ACCOUNT) accounts.push(eventAccount)
+
+  const results = await Promise.all(
+    accounts.map((acc) => fetchPixelEventsForAccount(acc, since, until)),
+  )
+  return results.flat()
+}
+
 // ── Fetch a nivel de anuncio (para join con GHL attribution_ad_id) ─────────────
 // GHL guarda el ad_id del anuncio específico en leads.attribution_ad_id.
 // Este endpoint descarga métricas por ad_id para el cruce correcto.
