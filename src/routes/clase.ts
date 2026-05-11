@@ -246,7 +246,8 @@ claseRouter.get('/meta', authenticate, async (req, res) => {
 // GET /api/clase/pixel-events?tag=clase+29/abril&since=&until=
 claseRouter.get('/pixel-events', authenticate, async (req, res) => {
   try {
-    const tag = (req.query['tag'] as string | undefined)?.trim() || null
+    const tag       = (req.query['tag']        as string | undefined)?.trim() || null
+    const accountId = (req.query['account_id'] as string | undefined)?.trim() || null
     const now = new Date()
     const reqUntil = (req.query['until'] as string | undefined) ?? now.toISOString().slice(0, 10)
     const reqSince = (req.query['since'] as string | undefined)
@@ -257,7 +258,7 @@ claseRouter.get('/pixel-events', authenticate, async (req, res) => {
     const since = weekRange?.since ?? reqSince
     const until = weekRange?.until ?? reqUntil
 
-    const all = await fetchPixelEvents(since, until)
+    const all = await fetchPixelEvents(since, until, accountId)
 
     // Filtrar a campañas de Clase en Vivo
     const claseRows = all.filter((r) =>

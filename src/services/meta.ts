@@ -342,23 +342,153 @@ async function fetchPixelEventsForAccount(
 
 /**
  * Descarga eventos del pixel agregados por campaña en el rango pedido.
- * Recorre la cuenta principal y la cuenta de eventos (si está configurada).
+ * Si se provee accountId, solo consulta esa cuenta; si no, consulta todas.
  */
 export async function fetchPixelEvents(
   since: string,
   until: string,
+  accountId?: string | null,
 ): Promise<MetaCampaignActionRow[]> {
   if (!META_TOKEN || !META_ACCOUNT) {
     throw new Error('META_ACCESS_TOKEN y META_AD_ACCOUNT_ID son requeridos')
   }
-  const accounts = [META_ACCOUNT]
+
   const eventAccount = process.env.META_AD_ACCOUNT_ID_EVENTOS
-  if (eventAccount && eventAccount !== META_ACCOUNT) accounts.push(eventAccount)
+  const all = [META_ACCOUNT, ...(eventAccount && eventAccount !== META_ACCOUNT ? [eventAccount] : [])]
+  const accounts = accountId ? all.filter((a) => a === accountId) : all
+
+  if (accounts.length === 0) {
+    throw new Error(`account_id "${accountId}" no está configurado en esta instancia`)
+  }
 
   const results = await Promise.all(
     accounts.map((acc) => fetchPixelEventsForAccount(acc, since, until)),
   )
   return results.flat()
+}
+
+// ── Pixels asociados a cada cuenta publicitaria ───────────────────────────────
+
+export interface MetaPixelInfo {
+  id:            string
+  name:          string
+  account_id:    string
+  creation_time?: number
+}
+
+async function fetchPixelsForAccount(accountId: string): Promise<MetaPixelInfo[]> {
+  if (!META_TOKEN) throw new Error('META_ACCESS_TOKEN requerido')
+
+  const proof = getAppSecretProof(META_TOKEN)
+  const params = new URLSearchParams({
+    fields:       'id,name,creation_time',
+    access_token: META_TOKEN,
+    ...(proof ? { appsecret_proof: proof } : {}),
+  })
+
+  const url = `${META_BASE}/act_${accountId}/adspixels?${params}`
+  console.log(`[Meta] Fetch pixels act_${accountId}`)
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), META_TIMEOUT_MS)
+  const res = await fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer))
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '')
+    throw new Error(`Meta API pixels act_${accountId} ${res.status}: ${body}`)
+  }
+
+  const page = await res.json() as { data?: Array<{ id: string; name: string; creation_time?: number }> }
+  return (page.data ?? []).map((p) => ({
+    id:            p.id,
+    name:          p.name,
+    account_id:    accountId,
+    creation_time: p.creation_time,
+  }))
+}
+
+// ── Pixel stats directos (equivalente a "Eventos totales" en Ads Manager) ─────
+// Consulta /{pixel_id}/stats en lugar de los campaign insights, por eso
+// los números coinciden exactamente con lo que muestra la sección de Eventos
+// de Meta Business Suite — incluye eventos de TODAS las campañas y canales.
+
+export interface MetaPixelEventStat {
+  event_name:  string
+  count:       number
+  unique_count?: number
+}
+
+export async function fetchPixelStats(
+  pixelId: string,
+  since:   string,   // YYYY-MM-DD
+  until:   string,   // YYYY-MM-DD
+): Promise<MetaPixelEventStat[]> {
+  if (!META_TOKEN) throw new Error('META_ACCESS_TOKEN requerido')
+
+  const startTime = Math.floor(new Date(`${since}T00:00:00Z`).getTime() / 1000)
+  const endTime   = Math.floor(new Date(`${until}T23:59:59Z`).getTime() / 1000)
+
+  const proof = getAppSecretProof(META_TOKEN)
+  const params = new URLSearchParams({
+    aggregation:  'event_total_counts',   // devuelve totales por evento — misma fuente que Ads Manager
+    start_time:   String(startTime),
+    end_time:     String(endTime),
+    access_token: META_TOKEN,
+    ...(proof ? { appsecret_proof: proof } : {}),
+  })
+
+  const url = `${META_BASE}/${pixelId}/stats?${params}`
+  console.log(`[Meta] Fetch pixel stats ${pixelId}. Rango: ${since} → ${until}`)
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), META_TIMEOUT_MS)
+  const res = await fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer))
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '')
+    throw new Error(`Meta API pixel-stats ${pixelId} ${res.status}: ${body}`)
+  }
+
+  // La API devuelve: { data: [{ aggregation: "event_total_counts", data: [{value, count}] }] }
+  const page = await res.json() as {
+    data?: Array<{
+      aggregation: string
+      data: Array<{ value: string; count: number }>
+    }>
+  }
+
+  // Acumular por event_name a través de todos los bloques de la respuesta
+  const totals = new Map<string, number>()
+  for (const block of page.data ?? []) {
+    for (const item of block.data ?? []) {
+      totals.set(item.value, (totals.get(item.value) ?? 0) + item.count)
+    }
+  }
+
+  return [...totals.entries()]
+    .map(([event_name, count]) => ({ event_name, count }))
+    .filter((s) => s.count > 0)
+    .sort((a, b) => b.count - a.count)
+}
+
+export async function fetchPixels(): Promise<MetaPixelInfo[]> {
+  if (!META_TOKEN || !META_ACCOUNT) {
+    throw new Error('META_ACCESS_TOKEN y META_AD_ACCOUNT_ID son requeridos')
+  }
+  const eventAccount = process.env.META_AD_ACCOUNT_ID_EVENTOS
+  const accounts = [META_ACCOUNT, ...(eventAccount && eventAccount !== META_ACCOUNT ? [eventAccount] : [])]
+
+  const results = await Promise.all(accounts.map((acc) => fetchPixelsForAccount(acc)))
+  const flat = results.flat()
+
+  // Deduplicar por pixel_id — el mismo pixel puede estar asociado a varias cuentas.
+  // Cuando aparece en múltiples cuentas se conserva la primera ocurrencia.
+  const seen = new Set<string>()
+  return flat.filter((p) => {
+    if (seen.has(p.id)) return false
+    seen.add(p.id)
+    return true
+  })
 }
 
 // ── Fetch a nivel de anuncio (para join con GHL attribution_ad_id) ─────────────

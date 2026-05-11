@@ -2,7 +2,7 @@ import { Router } from 'express'
 import { supabaseAdmin } from '../lib/supabase.js'
 import { authenticate } from '../middleware/auth.js'
 import { requireRole } from '../middleware/requireRole.js'
-import { extendToken } from '../services/meta.js'
+import { extendToken, fetchPixels, fetchPixelStats } from '../services/meta.js'
 import type { ApiError } from '../types/index.js'
 import type { MetaCampaignRow, MetaCampaignSummary, MetaCampaignsResponse } from './meta.types.js'
 
@@ -87,6 +87,71 @@ metaRouter.get('/campaigns', authenticate, async (req, res) => {
   } catch (err) {
     const apiErr: ApiError = {
       error:  err instanceof Error ? err.message : 'Error interno del servidor',
+      status: 500,
+    }
+    res.status(500).json(apiErr)
+  }
+})
+
+// =============================================================================
+// GET /api/meta/pixels
+// =============================================================================
+// Devuelve los píxeles de Meta asociados a cada cuenta publicitaria configurada.
+// =============================================================================
+
+const ACCOUNT_LABELS: Record<string, string> = {}
+if (process.env.META_AD_ACCOUNT_ID)
+  ACCOUNT_LABELS[process.env.META_AD_ACCOUNT_ID] = 'Cuenta Principal'
+if (process.env.META_AD_ACCOUNT_ID_EVENTOS)
+  ACCOUNT_LABELS[process.env.META_AD_ACCOUNT_ID_EVENTOS] = 'Eventos / CP5'
+
+metaRouter.get('/pixels', authenticate, async (_req, res) => {
+  try {
+    const raw = await fetchPixels()
+    const pixels = raw.map((p) => ({
+      ...p,
+      account_label: ACCOUNT_LABELS[p.account_id] ?? `act_${p.account_id}`,
+    }))
+    res.json({ pixels })
+  } catch (err) {
+    const apiErr: ApiError = {
+      error:  err instanceof Error ? err.message : 'Error al obtener pixels',
+      status: 500,
+    }
+    res.status(500).json(apiErr)
+  }
+})
+
+// =============================================================================
+// GET /api/meta/pixel-stats
+// =============================================================================
+// Devuelve los totales de eventos del pixel directamente desde la Graph API
+// (misma fuente que "Eventos totales" en Meta Ads Manager).
+//
+// Query params:
+//   pixel_id  — ID del pixel (requerido)
+//   since     — YYYY-MM-DD (default: hace 30 días)
+//   until     — YYYY-MM-DD (default: hoy)
+// =============================================================================
+
+metaRouter.get('/pixel-stats', authenticate, async (req, res) => {
+  try {
+    const pixelId = (req.query['pixel_id'] as string | undefined)?.trim()
+    if (!pixelId) {
+      res.status(400).json({ error: 'pixel_id requerido', status: 400 })
+      return
+    }
+
+    const now   = new Date()
+    const until = (req.query['until'] as string | undefined) ?? now.toISOString().slice(0, 10)
+    const since = (req.query['since'] as string | undefined)
+      ?? new Date(now.getTime() - 30 * 86_400_000).toISOString().slice(0, 10)
+
+    const stats = await fetchPixelStats(pixelId, since, until)
+    res.json({ pixel_id: pixelId, since, until, stats })
+  } catch (err) {
+    const apiErr: ApiError = {
+      error:  err instanceof Error ? err.message : 'Error al obtener stats del pixel',
       status: 500,
     }
     res.status(500).json(apiErr)

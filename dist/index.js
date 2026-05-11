@@ -12,6 +12,15 @@ const opportunities_js_1 = require("./routes/opportunities.js");
 const sync_js_1 = require("./routes/sync.js");
 const meta_js_1 = require("./routes/meta.js");
 const reports_js_1 = require("./routes/reports.js");
+const clase_js_1 = require("./routes/clase.js");
+const adsmanager_js_1 = require("./routes/adsmanager.js");
+const hotmart_js_1 = require("./routes/hotmart.js");
+const utm_js_1 = require("./routes/utm.js");
+const announcements_js_1 = require("./routes/announcements.js");
+const tutorials_js_1 = require("./routes/tutorials.js");
+const push_js_1 = require("./routes/push.js");
+const admin_js_1 = require("./routes/admin.js");
+const tracking_js_1 = require("./routes/tracking.js");
 const syncJob_js_1 = require("./jobs/syncJob.js");
 // ── Validar variables críticas al arrancar ────────────────────────────────────
 const REQUIRED_ENV = [
@@ -43,6 +52,20 @@ app.use('/api/opportunities', opportunities_js_1.opportunitiesRouter);
 app.use('/api/sync', sync_js_1.syncRouter);
 app.use('/api/meta', meta_js_1.metaRouter);
 app.use('/api/reports', reports_js_1.reportsRouter);
+app.use('/api/clase', clase_js_1.claseRouter);
+// AdsManager PRO
+app.use('/api/adsmanager', adsmanager_js_1.adsmanagerRouter);
+app.use('/api/hotmart', hotmart_js_1.hotmartRouter);
+app.post('/webhook/hotmart', (req, res, next) => {
+    req.url = '/webhook';
+    (0, hotmart_js_1.hotmartRouter)(req, res, next);
+});
+app.use('/api/utm', utm_js_1.utmRouter);
+app.use('/api/announcements', announcements_js_1.announcementsRouter);
+app.use('/api/tutorials', tutorials_js_1.tutorialsRouter);
+app.use('/api/push', push_js_1.pushRouter);
+app.use('/api/admin', admin_js_1.adminRouter);
+app.use('/api/tracking', tracking_js_1.trackingRouter);
 // ── 404 global ────────────────────────────────────────────────────────────────
 app.use((_req, res) => {
     res.status(404).json({ error: 'Ruta no encontrada', status: 404 });

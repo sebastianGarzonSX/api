@@ -13,6 +13,9 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.extendToken = extendToken;
 exports.fetchCampaignInsights = fetchCampaignInsights;
+exports.fetchPixelEvents = fetchPixelEvents;
+exports.fetchPixelStats = fetchPixelStats;
+exports.fetchPixels = fetchPixels;
 exports.fetchAdInsights = fetchAdInsights;
 exports.fetchAdCreatives = fetchAdCreatives;
 const crypto_1 = require("crypto");
@@ -85,10 +88,11 @@ function extractCostPerResult(actions, costPerActionType) {
     }
     return 0;
 }
-function normalizeInsight(raw) {
+function normalizeInsight(raw, accountId) {
     return {
         campaign_id: raw.campaign_id,
         campaign_name: raw.campaign_name,
+        account_id: accountId,
         date_start: raw.date_start,
         date_stop: raw.date_stop,
         impressions: Math.round(parseNum(raw.impressions)),
@@ -109,21 +113,12 @@ function normalizeInsight(raw) {
  * @param since  Fecha de inicio en formato YYYY-MM-DD
  * @param until  Fecha de fin en formato YYYY-MM-DD
  */
-async function fetchCampaignInsights(since, until) {
-    if (!META_TOKEN || !META_ACCOUNT) {
-        throw new Error('META_ACCESS_TOKEN y META_AD_ACCOUNT_ID son requeridos para sync de Meta');
-    }
+async function fetchCampaignInsightsForAccount(accountId, since, until) {
+    if (!META_TOKEN)
+        throw new Error('META_ACCESS_TOKEN requerido');
     const fields = [
-        'campaign_id',
-        'campaign_name',
-        'impressions',
-        'clicks',
-        'spend',
-        'reach',
-        'ctr',
-        'cpm',
-        'actions',
-        'cost_per_action_type',
+        'campaign_id', 'campaign_name', 'impressions', 'clicks',
+        'spend', 'reach', 'ctr', 'cpm', 'actions', 'cost_per_action_type',
     ].join(',');
     const proof = getAppSecretProof(META_TOKEN);
     const params = new URLSearchParams({
@@ -135,30 +130,186 @@ async function fetchCampaignInsights(since, until) {
         access_token: META_TOKEN,
         ...(proof ? { appsecret_proof: proof } : {}),
     });
-    let url = `${META_BASE}/act_${META_ACCOUNT}/insights?${params.toString()}`;
+    let url = `${META_BASE}/act_${accountId}/insights?${params.toString()}`;
     const all = [];
     let pageNum = 0;
-    console.log(`[Meta] Iniciando fetch de insights. Rango: ${since} → ${until}`);
+    console.log(`[Meta] Fetch campaign insights act_${accountId}. Rango: ${since} → ${until}`);
     while (url) {
         pageNum++;
-        console.log(`[Meta] Página ${pageNum} — acumulados: ${all.length}`);
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), META_TIMEOUT_MS);
         const res = await fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
         if (!res.ok) {
             const body = await res.text().catch(() => '');
-            throw new Error(`Meta API ${res.status}: ${body}`);
+            throw new Error(`Meta API act_${accountId} ${res.status}: ${body}`);
         }
         const page = await res.json();
-        if (page.data) {
-            all.push(...page.data.map(normalizeInsight));
-        }
+        if (page.data)
+            all.push(...page.data.map((r) => normalizeInsight(r, accountId)));
         url = page.paging?.next;
     }
-    console.log(`[Meta] Fetch completo: ${all.length} registros (${pageNum} páginas)`);
+    console.log(`[Meta] act_${accountId}: ${all.length} registros (${pageNum} páginas)`);
     return all;
 }
-function normalizeAdInsight(raw) {
+async function fetchCampaignInsights(since, until) {
+    if (!META_TOKEN || !META_ACCOUNT) {
+        throw new Error('META_ACCESS_TOKEN y META_AD_ACCOUNT_ID son requeridos para sync de Meta');
+    }
+    // Cuentas a sincronizar: cuenta principal + cuenta de eventos (si está configurada)
+    const accounts = [META_ACCOUNT];
+    const eventAccount = process.env.META_AD_ACCOUNT_ID_EVENTOS;
+    if (eventAccount && eventAccount !== META_ACCOUNT)
+        accounts.push(eventAccount);
+    const results = await Promise.all(accounts.map((acc) => fetchCampaignInsightsForAccount(acc, since, until)));
+    return results.flat();
+}
+async function fetchPixelEventsForAccount(accountId, since, until) {
+    if (!META_TOKEN)
+        throw new Error('META_ACCESS_TOKEN requerido');
+    const fields = [
+        'campaign_id', 'campaign_name', 'spend', 'impressions', 'clicks',
+        'actions', 'cost_per_action_type',
+    ].join(',');
+    const proof = getAppSecretProof(META_TOKEN);
+    const params = new URLSearchParams({
+        fields,
+        level: 'campaign',
+        // Sin time_increment: agregamos por toda la ventana, una fila por campaña.
+        time_range: JSON.stringify({ since, until }),
+        limit: '500',
+        access_token: META_TOKEN,
+        ...(proof ? { appsecret_proof: proof } : {}),
+    });
+    const url = `${META_BASE}/act_${accountId}/insights?${params.toString()}`;
+    console.log(`[Meta] Fetch pixel events act_${accountId}. Rango: ${since} → ${until}`);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), META_TIMEOUT_MS);
+    const res = await fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
+    if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new Error(`Meta API pixel-events act_${accountId} ${res.status}: ${body}`);
+    }
+    const page = await res.json();
+    return (page.data ?? []).map((raw) => {
+        const actions = {};
+        for (const a of raw.actions ?? [])
+            actions[a.action_type] = parseNum(a.value);
+        const costPer = {};
+        for (const c of raw.cost_per_action_type ?? [])
+            costPer[c.action_type] = parseNum(c.value);
+        return {
+            campaign_id: raw.campaign_id,
+            campaign_name: raw.campaign_name,
+            account_id: accountId,
+            date_start: raw.date_start,
+            date_stop: raw.date_stop,
+            spend: parseNum(raw.spend),
+            impressions: Math.round(parseNum(raw.impressions)),
+            clicks: Math.round(parseNum(raw.clicks)),
+            actions,
+            cost_per_action: costPer,
+        };
+    });
+}
+/**
+ * Descarga eventos del pixel agregados por campaña en el rango pedido.
+ * Si se provee accountId, solo consulta esa cuenta; si no, consulta todas.
+ */
+async function fetchPixelEvents(since, until, accountId) {
+    if (!META_TOKEN || !META_ACCOUNT) {
+        throw new Error('META_ACCESS_TOKEN y META_AD_ACCOUNT_ID son requeridos');
+    }
+    const eventAccount = process.env.META_AD_ACCOUNT_ID_EVENTOS;
+    const all = [META_ACCOUNT, ...(eventAccount && eventAccount !== META_ACCOUNT ? [eventAccount] : [])];
+    const accounts = accountId ? all.filter((a) => a === accountId) : all;
+    if (accounts.length === 0) {
+        throw new Error(`account_id "${accountId}" no está configurado en esta instancia`);
+    }
+    const results = await Promise.all(accounts.map((acc) => fetchPixelEventsForAccount(acc, since, until)));
+    return results.flat();
+}
+async function fetchPixelsForAccount(accountId) {
+    if (!META_TOKEN)
+        throw new Error('META_ACCESS_TOKEN requerido');
+    const proof = getAppSecretProof(META_TOKEN);
+    const params = new URLSearchParams({
+        fields: 'id,name,creation_time',
+        access_token: META_TOKEN,
+        ...(proof ? { appsecret_proof: proof } : {}),
+    });
+    const url = `${META_BASE}/act_${accountId}/adspixels?${params}`;
+    console.log(`[Meta] Fetch pixels act_${accountId}`);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), META_TIMEOUT_MS);
+    const res = await fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
+    if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new Error(`Meta API pixels act_${accountId} ${res.status}: ${body}`);
+    }
+    const page = await res.json();
+    return (page.data ?? []).map((p) => ({
+        id: p.id,
+        name: p.name,
+        account_id: accountId,
+        creation_time: p.creation_time,
+    }));
+}
+async function fetchPixelStats(pixelId, since, // YYYY-MM-DD
+until) {
+    if (!META_TOKEN)
+        throw new Error('META_ACCESS_TOKEN requerido');
+    const startTime = Math.floor(new Date(`${since}T00:00:00Z`).getTime() / 1000);
+    const endTime = Math.floor(new Date(`${until}T23:59:59Z`).getTime() / 1000);
+    const proof = getAppSecretProof(META_TOKEN);
+    const params = new URLSearchParams({
+        aggregation: 'event_total_counts', // devuelve totales por evento — misma fuente que Ads Manager
+        start_time: String(startTime),
+        end_time: String(endTime),
+        access_token: META_TOKEN,
+        ...(proof ? { appsecret_proof: proof } : {}),
+    });
+    const url = `${META_BASE}/${pixelId}/stats?${params}`;
+    console.log(`[Meta] Fetch pixel stats ${pixelId}. Rango: ${since} → ${until}`);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), META_TIMEOUT_MS);
+    const res = await fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
+    if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new Error(`Meta API pixel-stats ${pixelId} ${res.status}: ${body}`);
+    }
+    // La API devuelve: { data: [{ aggregation: "event_total_counts", data: [{value, count}] }] }
+    const page = await res.json();
+    // Acumular por event_name a través de todos los bloques de la respuesta
+    const totals = new Map();
+    for (const block of page.data ?? []) {
+        for (const item of block.data ?? []) {
+            totals.set(item.value, (totals.get(item.value) ?? 0) + item.count);
+        }
+    }
+    return [...totals.entries()]
+        .map(([event_name, count]) => ({ event_name, count }))
+        .filter((s) => s.count > 0)
+        .sort((a, b) => b.count - a.count);
+}
+async function fetchPixels() {
+    if (!META_TOKEN || !META_ACCOUNT) {
+        throw new Error('META_ACCESS_TOKEN y META_AD_ACCOUNT_ID son requeridos');
+    }
+    const eventAccount = process.env.META_AD_ACCOUNT_ID_EVENTOS;
+    const accounts = [META_ACCOUNT, ...(eventAccount && eventAccount !== META_ACCOUNT ? [eventAccount] : [])];
+    const results = await Promise.all(accounts.map((acc) => fetchPixelsForAccount(acc)));
+    const flat = results.flat();
+    // Deduplicar por pixel_id — el mismo pixel puede estar asociado a varias cuentas.
+    // Cuando aparece en múltiples cuentas se conserva la primera ocurrencia.
+    const seen = new Set();
+    return flat.filter((p) => {
+        if (seen.has(p.id))
+            return false;
+        seen.add(p.id);
+        return true;
+    });
+}
+function normalizeAdInsight(raw, accountId) {
     return {
         ad_id: raw.ad_id,
         ad_name: raw.ad_name ?? '',
@@ -166,6 +317,7 @@ function normalizeAdInsight(raw) {
         adset_name: raw.adset_name ?? '',
         campaign_id: raw.campaign_id,
         campaign_name: raw.campaign_name ?? '',
+        account_id: accountId,
         date_start: raw.date_start,
         date_stop: raw.date_stop,
         impressions: Math.round(parseNum(raw.impressions)),
@@ -178,29 +330,12 @@ function normalizeAdInsight(raw) {
         cost_per_result: extractCostPerResult(raw.actions, raw.cost_per_action_type),
     };
 }
-/**
- * Descarga métricas de Meta Ads a nivel de anuncio individual.
- * Permite cruzar con leads.attribution_ad_id de GHL para ROAS por anuncio.
- */
-async function fetchAdInsights(since, until) {
-    if (!META_TOKEN || !META_ACCOUNT) {
-        throw new Error('META_ACCESS_TOKEN y META_AD_ACCOUNT_ID son requeridos');
-    }
+async function fetchAdInsightsForAccount(accountId, since, until) {
+    if (!META_TOKEN)
+        throw new Error('META_ACCESS_TOKEN requerido');
     const fields = [
-        'ad_id',
-        'ad_name',
-        'adset_id',
-        'adset_name',
-        'campaign_id',
-        'campaign_name',
-        'impressions',
-        'clicks',
-        'spend',
-        'reach',
-        'ctr',
-        'cpm',
-        'actions',
-        'cost_per_action_type',
+        'ad_id', 'ad_name', 'adset_id', 'adset_name', 'campaign_id', 'campaign_name',
+        'impressions', 'clicks', 'spend', 'reach', 'ctr', 'cpm', 'actions', 'cost_per_action_type',
     ].join(',');
     const proof = getAppSecretProof(META_TOKEN);
     const params = new URLSearchParams({
@@ -212,28 +347,41 @@ async function fetchAdInsights(since, until) {
         access_token: META_TOKEN,
         ...(proof ? { appsecret_proof: proof } : {}),
     });
-    let url = `${META_BASE}/act_${META_ACCOUNT}/insights?${params.toString()}`;
+    let url = `${META_BASE}/act_${accountId}/insights?${params.toString()}`;
     const all = [];
     let pageNum = 0;
-    console.log(`[Meta] Iniciando fetch de insights a nivel AD. Rango: ${since} → ${until}`);
+    console.log(`[Meta] Fetch ad insights act_${accountId}. Rango: ${since} → ${until}`);
     while (url) {
         pageNum++;
-        console.log(`[Meta] Ad-level página ${pageNum} — acumulados: ${all.length}`);
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), META_TIMEOUT_MS);
         const res = await fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
         if (!res.ok) {
             const body = await res.text().catch(() => '');
-            throw new Error(`Meta API (ad level) ${res.status}: ${body}`);
+            throw new Error(`Meta API ad-level act_${accountId} ${res.status}: ${body}`);
         }
         const page = await res.json();
-        if (page.data) {
-            all.push(...page.data.map(normalizeAdInsight));
-        }
+        if (page.data)
+            all.push(...page.data.map((r) => normalizeAdInsight(r, accountId)));
         url = page.paging?.next;
     }
-    console.log(`[Meta] Ad-level fetch completo: ${all.length} registros`);
+    console.log(`[Meta] act_${accountId} ad-level: ${all.length} registros`);
     return all;
+}
+/**
+ * Descarga métricas de Meta Ads a nivel de anuncio individual.
+ * Permite cruzar con leads.attribution_ad_id de GHL para ROAS por anuncio.
+ */
+async function fetchAdInsights(since, until) {
+    if (!META_TOKEN || !META_ACCOUNT) {
+        throw new Error('META_ACCESS_TOKEN y META_AD_ACCOUNT_ID son requeridos');
+    }
+    const accounts = [META_ACCOUNT];
+    const eventAccount = process.env.META_AD_ACCOUNT_ID_EVENTOS;
+    if (eventAccount && eventAccount !== META_ACCOUNT)
+        accounts.push(eventAccount);
+    const results = await Promise.all(accounts.map((acc) => fetchAdInsightsForAccount(acc, since, until)));
+    return results.flat();
 }
 async function fetchAdCreatives(adIds) {
     if (!META_TOKEN || adIds.length === 0)
@@ -270,7 +418,7 @@ async function fetchAdCreatives(adIds) {
                         rawStatus === 'DELETED' ? 'DELETED' : 'UNKNOWN';
             results.push({
                 ad_id: adId,
-                thumbnail_url: ad.creative?.thumbnail_url ?? ad.creative?.image_url ?? null,
+                thumbnail_url: ad.creative?.image_url ?? ad.creative?.thumbnail_url ?? null,
                 preview_link: ad.preview_shareable_link ?? null,
                 ad_status: adStatus,
             });

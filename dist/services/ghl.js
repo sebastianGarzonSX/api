@@ -1,8 +1,11 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.fetchAllContacts = fetchAllContacts;
+exports.fetchContactById = fetchContactById;
 exports.fetchAllOpportunities = fetchAllOpportunities;
 exports.fetchAllPipelines = fetchAllPipelines;
+exports.fetchCalendarAppointments = fetchCalendarAppointments;
+exports.fetchCustomFieldDefinitions = fetchCustomFieldDefinitions;
 const GHL_BASE_URL = 'https://services.leadconnectorhq.com';
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION = process.env.GHL_LOCATION_ID;
@@ -78,6 +81,16 @@ async function fetchAllContacts(sinceEpochMs) {
     console.log(`[GHL] Fetch contactos completo: ${all.length} contactos`);
     return all;
 }
+// ── Contacto individual ───────────────────────────────────────────────────────
+async function fetchContactById(contactId) {
+    try {
+        const data = await ghlFetch(`/contacts/${contactId}`);
+        return data.contact ?? null;
+    }
+    catch {
+        return null;
+    }
+}
 // ── Oportunidades ─────────────────────────────────────────────────────────────
 async function fetchAllOpportunities() {
     const all = [];
@@ -105,4 +118,42 @@ async function fetchAllPipelines() {
     const data = await ghlFetch(`/opportunities/pipelines?locationId=${GHL_LOCATION}`);
     console.log(`[GHL] ${data.pipelines.length} pipelines obtenidos`);
     return data.pipelines;
+}
+/**
+ * Obtiene citas de un calendario GHL en un rango de fechas.
+ * Endpoint real: GET /calendars/events  (no /calendars/appointments)
+ * Params: locationId, calendarId, startTime (ms), endTime (ms)
+ */
+async function fetchCalendarAppointments(calendarId, since, // YYYY-MM-DD
+until) {
+    const startTime = new Date(since).getTime();
+    const endTime = new Date(until + 'T23:59:59').getTime();
+    console.log(`[GHL] Calendar events calendarId="${calendarId}" ${since} → ${until}`);
+    const params = new URLSearchParams({
+        locationId: GHL_LOCATION,
+        calendarId,
+        startTime: String(startTime),
+        endTime: String(endTime),
+    });
+    try {
+        const data = await ghlFetch(`/calendars/events?${params.toString()}`);
+        return data.events ?? [];
+    }
+    catch (err) {
+        console.warn('[GHL] Error al obtener calendar events:', err);
+        throw err;
+    }
+}
+// ── Custom Field Definitions ──────────────────────────────────────────────────
+async function fetchCustomFieldDefinitions() {
+    console.log(`[GHL] Fetch de custom field definitions. Location: "${GHL_LOCATION}"`);
+    try {
+        const data = await ghlFetch(`/custom-fields/?locationId=${GHL_LOCATION}`);
+        console.log(`[GHL] ${data.customFields?.length ?? 0} custom fields obtenidos`);
+        return data.customFields ?? [];
+    }
+    catch (err) {
+        console.warn(`[GHL] No se pudieron obtener custom fields:`, err);
+        return [];
+    }
 }

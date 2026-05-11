@@ -15,6 +15,35 @@ const meta_js_1 = require("./meta.js");
 // Sync de oportunidades: siempre completo (stages cambian, son ~2400).
 // Sync de Meta: últimos 30 días (o 90 días en sync forzado).
 // =============================================================================
+// ── Helpers de enriquecimiento ────────────────────────────────────────────────
+const CITY_PATTERNS = [
+    { city: 'bogota', patterns: ['bogotá', 'bogota'] },
+    { city: 'bucaramanga', patterns: ['bucaramanga'] },
+    { city: 'medellin', patterns: ['medellín', 'medellin'] },
+    { city: 'barranquilla', patterns: ['barranquilla'] },
+];
+function extractCityFromTags(tags) {
+    const joined = tags.join(' ').toLowerCase();
+    for (const { city, patterns } of CITY_PATTERNS) {
+        if (patterns.some((p) => joined.includes(p)))
+            return city;
+    }
+    return null;
+}
+const SURVEY_TAG_MAP = {
+    lm_dolores: 'dolores',
+    lm_ventas: 'ventas',
+    lm_claridad: 'claridad',
+    lm_equipos: 'equipos',
+};
+function extractSurveyResponse(tags) {
+    for (const tag of tags) {
+        const val = SURVEY_TAG_MAP[tag.toLowerCase()];
+        if (val)
+            return val;
+    }
+    return null;
+}
 // ── Mapeo de stage ────────────────────────────────────────────────────────────
 function buildContactName(c) {
     if (c.contactName)
@@ -47,6 +76,45 @@ function mapGHLStatus(status) {
         return 'lost';
     return 'open';
 }
+// ── Transformar GHLContact → lead payload ─────────────────────────────────────
+function contactToLeadPayload(c, fieldNameMap, contactStageMap) {
+    const firstAttr = c.attributions?.find((a) => a.isFirst) ?? c.attributions?.[0];
+    const customFieldsObj = {};
+    for (const cf of c.customFields ?? []) {
+        const name = fieldNameMap.get(cf.id) ?? cf.id;
+        const raw = cf.value ?? cf.fieldValue;
+        const val = Array.isArray(raw) ? raw.join(', ') : (raw ?? '');
+        if (val)
+            customFieldsObj[name] = val;
+    }
+    const contactTags = c.tags ?? [];
+    const dateAdded = c.dateAdded ?? null;
+    const dateUpdated = c.dateUpdated ?? null;
+    const interacted = dateUpdated && dateAdded
+        ? new Date(dateUpdated).getTime() > new Date(dateAdded).getTime() + 6 * 3_600_000
+        : dateUpdated != null;
+    return {
+        ghl_contact_id: c.id,
+        name: buildContactName(c),
+        email: c.email || null,
+        phone: c.phone || null,
+        source: c.source || null,
+        stage: contactStageMap.get(c.id) ?? 'new',
+        ghl_date_added: dateAdded,
+        last_activity_at: dateUpdated,
+        tags: contactTags,
+        city: extractCityFromTags(contactTags),
+        interaction_status: interacted ? 'interacted' : 'cold',
+        survey_response: extractSurveyResponse(contactTags),
+        custom_fields: customFieldsObj,
+        attribution_ad_id: firstAttr?.utmAdId ?? null,
+        attribution_ad_name: firstAttr?.adName ?? null,
+        attribution_utm_source: firstAttr?.utmSessionSource ?? null,
+        attribution_medium: firstAttr?.medium ?? null,
+        attribution_page_url: firstAttr?.pageUrl ?? null,
+        updated_at: new Date().toISOString(),
+    };
+}
 // ── Helpers de sync_state ─────────────────────────────────────────────────────
 async function getSyncState(key) {
     const { data } = await supabase_js_1.supabaseAdmin
@@ -75,7 +143,45 @@ async function runSync(force = false) {
     let pipelines_upserted = 0;
     let meta_records_upserted = 0;
     console.log(`[Sync] Iniciando sincronización${force ? ' COMPLETA (force)' : ' incremental'}…`);
-    // ── Paso 0: Pipelines (caché de nombres y stages) ─────────────────────────
+    // ── Paso 0a: Custom Field Definitions ────────────────────────────────────
+    // Sincronizar primero para tener el mapa id → name al procesar contactos.
+    const fieldNameMap = new Map();
+    try {
+        const fieldDefs = await (0, ghl_js_1.fetchCustomFieldDefinitions)();
+        for (const f of fieldDefs) {
+            fieldNameMap.set(f.id, f.name);
+        }
+        if (fieldDefs.length > 0) {
+            const defsPayload = fieldDefs.map((f) => ({
+                ghl_field_id: f.id,
+                name: f.name,
+                field_key: f.fieldKey ?? null,
+                data_type: f.dataType ?? null,
+                synced_at: new Date().toISOString(),
+            }));
+            await supabase_js_1.supabaseAdmin
+                .from('custom_field_definitions')
+                .upsert(defsPayload, { onConflict: 'ghl_field_id' });
+            console.log(`[Sync] ${fieldDefs.length} custom field definitions sincronizadas`);
+        }
+    }
+    catch (err) {
+        console.warn(`[Sync] fetchCustomFieldDefinitions falló, cargando desde DB como fallback`);
+        errors.push(`fetchCustomFieldDefinitions: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    // Fallback: si el fetch falló, cargar definiciones desde la DB
+    if (fieldNameMap.size === 0) {
+        const { data: dbDefs } = await supabase_js_1.supabaseAdmin
+            .from('custom_field_definitions')
+            .select('ghl_field_id, name');
+        for (const d of dbDefs ?? []) {
+            fieldNameMap.set(d.ghl_field_id, d.name);
+        }
+        if (fieldNameMap.size > 0) {
+            console.log(`[Sync] ${fieldNameMap.size} custom field definitions cargadas desde DB (fallback)`);
+        }
+    }
+    // ── Paso 0b: Pipelines (caché de nombres y stages) ────────────────────────
     // Siempre sincronizar — son pocos y necesitamos los nombres para el join.
     let ghlPipelines = [];
     try {
@@ -165,26 +271,7 @@ async function runSync(force = false) {
             uniqueContacts.set(c.id, c);
         }
         console.log(`[Sync] Contactos únicos: ${uniqueContacts.size}`);
-        const leadsPayload = [...uniqueContacts.values()].map((c) => {
-            // Atribución del primer toque (isFirst=true); si no hay, tomar el primero
-            const firstAttr = c.attributions?.find((a) => a.isFirst) ?? c.attributions?.[0];
-            return {
-                ghl_contact_id: c.id,
-                name: buildContactName(c),
-                email: c.email || null,
-                phone: c.phone || null,
-                source: c.source || null,
-                stage: contactStageMap.get(c.id) ?? 'new',
-                ghl_date_added: c.dateAdded ?? null,
-                tags: c.tags ?? [],
-                attribution_ad_id: firstAttr?.utmAdId ?? null,
-                attribution_ad_name: firstAttr?.adName ?? null,
-                attribution_utm_source: firstAttr?.utmSessionSource ?? null,
-                attribution_medium: firstAttr?.medium ?? null,
-                attribution_page_url: firstAttr?.pageUrl ?? null,
-                updated_at: new Date().toISOString(),
-            };
-        });
+        const leadsPayload = [...uniqueContacts.values()].map((c) => contactToLeadPayload(c, fieldNameMap, contactStageMap));
         for (let i = 0; i < leadsPayload.length; i += 500) {
             const batch = leadsPayload.slice(i, i + 500);
             const { error } = await supabase_js_1.supabaseAdmin
@@ -222,6 +309,39 @@ async function runSync(force = false) {
             }
         }
         console.log(`[Sync] Lead ID map: ${leadIdMap.size} entradas`);
+        // ── Rescue: traer contactos huérfanos que tienen oportunidades pero no
+        //    están en la tabla leads (p.ej. contactos viejos que el sync incremental
+        //    no trajo, pero que fueron agregados a un pipeline recientemente) ──────
+        const orphanContactIds = contactIds.filter((id) => !leadIdMap.has(id));
+        if (orphanContactIds.length > 0) {
+            console.log(`[Sync] ${orphanContactIds.length} contactos huérfanos detectados — rescatando de GHL…`);
+            let rescued = 0;
+            for (const cid of orphanContactIds) {
+                try {
+                    const contact = await (0, ghl_js_1.fetchContactById)(cid);
+                    if (!contact)
+                        continue;
+                    const payload = contactToLeadPayload(contact, fieldNameMap, contactStageMap);
+                    const { data: upserted, error: uErr } = await supabase_js_1.supabaseAdmin
+                        .from('leads')
+                        .upsert(payload, { onConflict: 'ghl_contact_id' })
+                        .select('id, ghl_contact_id')
+                        .single();
+                    if (uErr) {
+                        errors.push(`rescue lead ${cid}: ${uErr.message}`);
+                    }
+                    else if (upserted) {
+                        leadIdMap.set(upserted.ghl_contact_id, upserted.id);
+                        leads_upserted++;
+                        rescued++;
+                    }
+                }
+                catch (err) {
+                    errors.push(`rescue fetch ${cid}: ${err instanceof Error ? err.message : String(err)}`);
+                }
+            }
+            console.log(`[Sync] ${rescued}/${orphanContactIds.length} contactos huérfanos rescatados`);
+        }
         const uniqueOpps = new Map();
         for (const o of ghlOpportunities) {
             uniqueOpps.set(o.id, o);

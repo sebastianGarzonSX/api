@@ -87,6 +87,66 @@ exports.metaRouter.get('/campaigns', auth_js_1.authenticate, async (req, res) =>
     }
 });
 // =============================================================================
+// GET /api/meta/pixels
+// =============================================================================
+// Devuelve los píxeles de Meta asociados a cada cuenta publicitaria configurada.
+// =============================================================================
+const ACCOUNT_LABELS = {};
+if (process.env.META_AD_ACCOUNT_ID)
+    ACCOUNT_LABELS[process.env.META_AD_ACCOUNT_ID] = 'Cuenta Principal';
+if (process.env.META_AD_ACCOUNT_ID_EVENTOS)
+    ACCOUNT_LABELS[process.env.META_AD_ACCOUNT_ID_EVENTOS] = 'Eventos / CP5';
+exports.metaRouter.get('/pixels', auth_js_1.authenticate, async (_req, res) => {
+    try {
+        const raw = await (0, meta_js_1.fetchPixels)();
+        const pixels = raw.map((p) => ({
+            ...p,
+            account_label: ACCOUNT_LABELS[p.account_id] ?? `act_${p.account_id}`,
+        }));
+        res.json({ pixels });
+    }
+    catch (err) {
+        const apiErr = {
+            error: err instanceof Error ? err.message : 'Error al obtener pixels',
+            status: 500,
+        };
+        res.status(500).json(apiErr);
+    }
+});
+// =============================================================================
+// GET /api/meta/pixel-stats
+// =============================================================================
+// Devuelve los totales de eventos del pixel directamente desde la Graph API
+// (misma fuente que "Eventos totales" en Meta Ads Manager).
+//
+// Query params:
+//   pixel_id  — ID del pixel (requerido)
+//   since     — YYYY-MM-DD (default: hace 30 días)
+//   until     — YYYY-MM-DD (default: hoy)
+// =============================================================================
+exports.metaRouter.get('/pixel-stats', auth_js_1.authenticate, async (req, res) => {
+    try {
+        const pixelId = req.query['pixel_id']?.trim();
+        if (!pixelId) {
+            res.status(400).json({ error: 'pixel_id requerido', status: 400 });
+            return;
+        }
+        const now = new Date();
+        const until = req.query['until'] ?? now.toISOString().slice(0, 10);
+        const since = req.query['since']
+            ?? new Date(now.getTime() - 30 * 86_400_000).toISOString().slice(0, 10);
+        const stats = await (0, meta_js_1.fetchPixelStats)(pixelId, since, until);
+        res.json({ pixel_id: pixelId, since, until, stats });
+    }
+    catch (err) {
+        const apiErr = {
+            error: err instanceof Error ? err.message : 'Error al obtener stats del pixel',
+            status: 500,
+        };
+        res.status(500).json(apiErr);
+    }
+});
+// =============================================================================
 // POST /api/meta/extend-token
 // =============================================================================
 // Extiende un token de corta duración (2h) a larga duración (60 días).
