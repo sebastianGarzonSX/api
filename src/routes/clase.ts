@@ -35,6 +35,27 @@ function tagToWeekRange(tag: string): { since: string; until: string } | null {
   }
 }
 
+// "clase 13/mayo" → Date(2026-05-13). Año inferido tomando el candidato más
+// cercano al `ref` (±6 meses), para tolerar tags creados al cambio de año.
+function tagToClassDate(tag: string, ref: Date = new Date()): Date | null {
+  const m = tag.toLowerCase().match(/clase\s+(\d{1,2})\/([a-záéíóú]+)/)
+  if (!m) return null
+  const month = MONTH_MAP[m[2]]
+  if (!month) return null
+  const day = m[1].padStart(2, '0')
+
+  const refYear = ref.getUTCFullYear()
+  const candidates = [refYear - 1, refYear, refYear + 1]
+    .map(y => new Date(`${y}-${month}-${day}T00:00:00Z`))
+    .filter(d => !isNaN(d.getTime()))
+  if (candidates.length === 0) return null
+
+  candidates.sort(
+    (a, b) => Math.abs(a.getTime() - ref.getTime()) - Math.abs(b.getTime() - ref.getTime()),
+  )
+  return candidates[0]
+}
+
 // GET /api/clase/report?tag=clase+29/abril&since=&until=
 claseRouter.get('/report', authenticate, async (req, res) => {
   try {
@@ -406,13 +427,17 @@ claseRouter.get('/appointments', authenticate, async (req, res) => {
     const reqSince = (req.query['since'] as string | undefined)
       ?? new Date(now.getTime() - 7 * 86_400_000).toISOString().slice(0, 10)
 
-    // Cuando se filtra por tag, ampliamos la ventana: −30 / +60 días desde el rango pedido,
-    // así capturamos agendamientos en semanas siguientes a la clase.
-    const since = tag
-      ? new Date(new Date(reqSince).getTime() - 30 * 86_400_000).toISOString().slice(0, 10)
+    // Si el tag tiene formato "clase DD/mes", la ventana se ancla a la fecha de la
+    // clase: [fecha_clase, fecha_clase + 60 días]. La UI muestra "conversiones
+    // post-clase", así que solo nos interesan citas EN o DESPUÉS del día del evento.
+    // Esto evita arrastrar citas de otras clases anteriores cuyo lead acumuló el tag.
+    // Si el tag no es parseable, respetamos el rango pedido por la UI sin expansión.
+    const classDate = tag ? tagToClassDate(tag, now) : null
+    const since = classDate
+      ? classDate.toISOString().slice(0, 10)
       : reqSince
-    const until = tag
-      ? new Date(new Date(reqUntil).getTime() + 60 * 86_400_000).toISOString().slice(0, 10)
+    const until = classDate
+      ? new Date(classDate.getTime() + 60 * 86_400_000).toISOString().slice(0, 10)
       : reqUntil
 
     // Leer calendar_id guardado
@@ -448,9 +473,17 @@ claseRouter.get('/appointments', authenticate, async (req, res) => {
     }
 
     // Aplicar filtro de tag (si corresponde)
-    const filtered = allowedContactIds
+    let filtered = allowedContactIds
       ? appointments.filter(a => a.contactId && allowedContactIds!.has(a.contactId))
       : appointments
+
+    // Defensa: si tenemos fecha de la clase, descartamos citas previas a ese día.
+    // GHL devuelve startTime con offset (p.ej. "2026-05-13T10:00:00-05:00"); usamos
+    // el día calendario (slice 0..10) en hora local del evento para comparar.
+    if (classDate) {
+      const classDay = classDate.toISOString().slice(0, 10)
+      filtered = filtered.filter(a => (a.startTime?.slice(0, 10) ?? '') >= classDay)
+    }
 
     // Excluir canceladas y eliminadas
     const active = filtered.filter(a => a.appointmentStatus !== 'cancelled' && !a.deleted)
